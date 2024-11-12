@@ -14,7 +14,6 @@ import warp as wp
 import warp.fem as fem
 from warp.fem import Coords, D, Domain, Field, Sample, curl, div, grad, integrand, normal
 from warp.fem.cache import dynamic_kernel
-from warp.fem.geometry import DeformedGeometry
 from warp.fem.geometry.closest_point import project_on_tet_at_origin, project_on_tri_at_origin
 from warp.fem.space import shape
 from warp.fem.types import make_free_sample
@@ -27,6 +26,9 @@ from warp.fem.utils import (
     symmetric_eigenvalues_qr,
 )
 from warp.tests.unittest_utils import *
+
+vec6f = wp.vec(length=6, dtype=float)
+mat66f = wp.mat(shape=(6, 6), dtype=float)
 
 
 @integrand
@@ -388,97 +390,91 @@ def _gen_hexmesh(N):
     return wp.array(positions, dtype=wp.vec3), wp.array(vidx, dtype=int)
 
 
+@fem.integrand(kernel_options={"enable_backward": False})
+def _test_geo_cells(
+    s: fem.Sample,
+    domain: fem.Domain,
+    cell_measures: wp.array(dtype=float),
+):
+    wp.atomic_add(cell_measures, s.element_index, fem.measure(domain, s) * s.qp_weight)
+
+
+@fem.integrand(kernel_options={"enable_backward": False, "max_unroll": 1})
+def _test_geo_sides(
+    s: fem.Sample,
+    domain: fem.Domain,
+    ref_measure: float,
+    side_measures: wp.array(dtype=float),
+):
+    side_index = s.element_index
+    coords = s.element_coords
+
+    cells = fem.cells(domain)
+
+    inner_s = fem.to_inner_cell(domain, s)
+    outer_s = fem.to_outer_cell(domain, s)
+
+    pos_side = domain(s)
+    pos_inner = cells(inner_s)
+    pos_outer = cells(outer_s)
+
+    for k in range(type(pos_side).length):
+        wp.expect_near(pos_side[k], pos_inner[k], 0.0001)
+        wp.expect_near(pos_side[k], pos_outer[k], 0.0001)
+
+    inner_side_s = fem.to_cell_side(domain, inner_s, side_index)
+    outer_side_s = fem.to_cell_side(domain, outer_s, side_index)
+
+    wp.expect_near(coords, inner_side_s.element_coords, 0.0001)
+    wp.expect_near(coords, outer_side_s.element_coords, 0.0001)
+
+    area = fem.measure(domain, s)
+    wp.atomic_add(side_measures, side_index, area * s.qp_weight)
+
+    F = fem.deformation_gradient(domain, s)
+    F_det = fem.Geometry._element_measure(F)
+    wp.expect_near(F_det * ref_measure, area)
+
+
+@fem.integrand(kernel_options={"enable_backward": False, "max_unroll": 1})
+def _test_side_normals(
+    s: fem.Sample,
+    domain: fem.Domain,
+):
+    # test consistency of side normal, measure, and deformation gradient
+    F = fem.deformation_gradient(domain, s)
+
+    nor = fem.normal(domain, s)
+    F_cross = fem.Geometry._element_normal(F)
+
+    for k in range(type(nor).length):
+        wp.expect_near(F_cross[k], nor[k], 0.0001)
+
+
 def _launch_test_geometry_kernel(geo: fem.Geometry, device):
-    @dynamic_kernel(suffix=geo.name, kernel_options={"enable_backward": False})
-    def test_geo_cells_kernel(
-        cell_arg: geo.CellArg,
-        qps: wp.array(dtype=Coords),
-        qp_weights: wp.array(dtype=float),
-        cell_measures: wp.array(dtype=float),
-    ):
-        cell_index, q = wp.tid()
-
-        coords = qps[q]
-        s = make_free_sample(cell_index, coords)
-
-        wp.atomic_add(cell_measures, cell_index, geo.cell_measure(cell_arg, s) * qp_weights[q])
-
-    REF_MEASURE = geo.reference_side().measure()
-
-    @dynamic_kernel(suffix=geo.name, kernel_options={"enable_backward": False, "max_unroll": 1})
-    def test_geo_sides_kernel(
-        side_arg: geo.SideArg,
-        qps: wp.array(dtype=Coords),
-        qp_weights: wp.array(dtype=float),
-        side_measures: wp.array(dtype=float),
-    ):
-        side_index, q = wp.tid()
-
-        coords = qps[q]
-        s = make_free_sample(side_index, coords)
-
-        cell_arg = geo.side_to_cell_arg(side_arg)
-        inner_cell_index = geo.side_inner_cell_index(side_arg, side_index)
-        outer_cell_index = geo.side_outer_cell_index(side_arg, side_index)
-        inner_cell_coords = geo.side_inner_cell_coords(side_arg, side_index, coords)
-        outer_cell_coords = geo.side_outer_cell_coords(side_arg, side_index, coords)
-
-        inner_s = make_free_sample(inner_cell_index, inner_cell_coords)
-        outer_s = make_free_sample(outer_cell_index, outer_cell_coords)
-
-        pos_side = geo.side_position(side_arg, s)
-        pos_inner = geo.cell_position(cell_arg, inner_s)
-        pos_outer = geo.cell_position(cell_arg, outer_s)
-
-        for k in range(type(pos_side).length):
-            wp.expect_near(pos_side[k], pos_inner[k], 0.0001)
-            wp.expect_near(pos_side[k], pos_outer[k], 0.0001)
-
-        inner_side_coords = geo.side_from_cell_coords(side_arg, side_index, inner_cell_index, inner_cell_coords)
-        outer_side_coords = geo.side_from_cell_coords(side_arg, side_index, outer_cell_index, outer_cell_coords)
-
-        wp.expect_near(coords, inner_side_coords, 0.0001)
-        wp.expect_near(coords, outer_side_coords, 0.0001)
-
-        area = geo.side_measure(side_arg, s)
-        wp.atomic_add(side_measures, side_index, area * qp_weights[q])
-
-        # test consistency of side normal, measure, and deformation gradient
-        F = geo.side_deformation_gradient(side_arg, s)
-        F_det = DeformedGeometry._side_measure(F)
-        wp.expect_near(F_det * REF_MEASURE, area)
-
-        nor = geo.side_normal(side_arg, s)
-        F_cross = DeformedGeometry._side_normal(F)
-
-        for k in range(type(pos_side).length):
-            wp.expect_near(F_cross[k], nor[k], 0.0001)
-
     cell_measures = wp.zeros(dtype=float, device=device, shape=geo.cell_count())
-
     cell_quadrature = fem.RegularQuadrature(fem.Cells(geo), order=2)
-    cell_qps = wp.array(cell_quadrature.points, dtype=Coords, device=device)
-    cell_qp_weights = wp.array(cell_quadrature.weights, dtype=float, device=device)
-
-    wp.launch(
-        kernel=test_geo_cells_kernel,
-        dim=(geo.cell_count(), cell_qps.shape[0]),
-        inputs=[geo.cell_arg_value(device), cell_qps, cell_qp_weights, cell_measures],
-        device=device,
-    )
 
     side_measures = wp.zeros(dtype=float, device=device, shape=geo.side_count())
-
     side_quadrature = fem.RegularQuadrature(fem.Sides(geo), order=2)
-    side_qps = wp.array(side_quadrature.points, dtype=Coords, device=device)
-    side_qp_weights = wp.array(side_quadrature.weights, dtype=float, device=device)
 
-    wp.launch(
-        kernel=test_geo_sides_kernel,
-        dim=(geo.side_count(), side_qps.shape[0]),
-        inputs=[geo.side_arg_value(device), side_qps, side_qp_weights, side_measures],
-        device=device,
-    )
+    with wp.ScopedDevice(device):
+        fem.interpolate(
+            _test_geo_cells,
+            quadrature=cell_quadrature,
+            values={"cell_measures": cell_measures},
+        )
+        fem.interpolate(
+            _test_geo_sides,
+            quadrature=side_quadrature,
+            values={"side_measures": side_measures, "ref_measure": geo.reference_side().measure()},
+        )
+
+        if geo.side_normal is not None:
+            fem.interpolate(
+                _test_side_normals,
+                quadrature=side_quadrature,
+            )
 
     return side_measures, cell_measures
 
@@ -517,6 +513,24 @@ def test_triangle_mesh(test, device):
     assert_np_equal(cell_measures.numpy(), np.full(cell_measures.shape, 0.5 / (N**2)), tol=1.0e-4)
     test.assertAlmostEqual(np.sum(side_measures.numpy()), 2 * (N + 1) + N * math.sqrt(2.0), places=4)
 
+    # 3d
+
+    positions = positions.numpy()
+    positions = np.hstack((positions, np.ones((positions.shape[0], 1))))
+    positions = wp.array(positions, device=device, dtype=wp.vec3)
+
+    geo = fem.Trimesh3D(tri_vertex_indices=tri_vidx, positions=positions)
+
+    test.assertEqual(geo.cell_count(), 2 * (N) ** 2)
+    test.assertEqual(geo.vertex_count(), (N + 1) ** 2)
+    test.assertEqual(geo.side_count(), 2 * (N + 1) * N + (N**2))
+    test.assertEqual(geo.boundary_side_count(), 4 * N)
+
+    side_measures, cell_measures = _launch_test_geometry_kernel(geo, device)
+
+    assert_np_equal(cell_measures.numpy(), np.full(cell_measures.shape, 0.5 / (N**2)), tol=1.0e-4)
+    test.assertAlmostEqual(np.sum(side_measures.numpy()), 2 * (N + 1) + N * math.sqrt(2.0), places=4)
+
 
 def test_quad_mesh(test, device):
     N = 3
@@ -525,6 +539,24 @@ def test_quad_mesh(test, device):
         positions, quad_vidx = _gen_quadmesh(N)
 
     geo = fem.Quadmesh2D(quad_vertex_indices=quad_vidx, positions=positions)
+
+    test.assertEqual(geo.cell_count(), N**2)
+    test.assertEqual(geo.vertex_count(), (N + 1) ** 2)
+    test.assertEqual(geo.side_count(), 2 * (N + 1) * N)
+    test.assertEqual(geo.boundary_side_count(), 4 * N)
+
+    side_measures, cell_measures = _launch_test_geometry_kernel(geo, device)
+
+    assert_np_equal(side_measures.numpy(), np.full(side_measures.shape, 1.0 / (N)), tol=1.0e-4)
+    assert_np_equal(cell_measures.numpy(), np.full(cell_measures.shape, 1.0 / (N**2)), tol=1.0e-4)
+
+    # 3d
+
+    positions = positions.numpy()
+    positions = np.hstack((positions, np.ones((positions.shape[0], 1))))
+    positions = wp.array(positions, device=device, dtype=wp.vec3)
+
+    geo = fem.Quadmesh3D(quad_vertex_indices=quad_vidx, positions=positions)
 
     test.assertEqual(geo.cell_count(), N**2)
     test.assertEqual(geo.vertex_count(), (N + 1) ** 2)
@@ -614,6 +646,66 @@ def test_nanogrid(test, device):
 
     assert_np_equal(side_measures.numpy(), np.full(side_measures.shape, 1.0 / (N**2)), tol=1.0e-4)
     assert_np_equal(cell_measures.numpy(), np.full(cell_measures.shape, 1.0 / (N**3)), tol=1.0e-4)
+
+
+@wp.func
+def _refinement_field(x: wp.vec3):
+    return 4.0 * (wp.length(x) - 0.5)
+
+
+def test_adaptive_nanogrid(test, device):
+    # 3 res-1 voxels, 8 res-0 voxels
+
+    res0 = wp.array(
+        [
+            [2, 2, 0],
+            [2, 3, 0],
+            [3, 2, 0],
+            [3, 3, 0],
+            [2, 2, 1],
+            [2, 3, 1],
+            [3, 2, 1],
+            [3, 3, 1],
+        ],
+        dtype=int,
+        device=device,
+    )
+    res1 = wp.array(
+        [
+            [0, 0, 0],
+            [0, 1, 0],
+            [1, 0, 0],
+            [1, 1, 0],
+        ],
+        dtype=int,
+        device=device,
+    )
+
+    grid0 = wp.Volume.allocate_by_voxels(res0, 0.5, device=device)
+    grid1 = wp.Volume.allocate_by_voxels(res1, 1.0, device=device)
+    geo = fem.adaptive_nanogrid_from_hierarchy([grid0, grid1])
+
+    test.assertEqual(geo.cell_count(), 3 + 8)
+    test.assertEqual(geo.vertex_count(), 2 * 9 + 27 - 8)
+    test.assertEqual(geo.side_count(), 2 * 4 + 6 * 2 + (3 * (2 + 1) * 2**2 - 6))
+    test.assertEqual(geo.boundary_side_count(), 2 * 4 + 4 * 2 + (4 * 4 - 4))
+    # test.assertEqual(geo.edge_count(), 6 * 4 + 9 + (3 * 2 * (2 + 1) ** 2 - 12))
+    test.assertEqual(geo.stacked_face_count(), geo.side_count() + 2)
+    test.assertEqual(geo.stacked_edge_count(), 6 * 4 + 9 + (3 * 2 * (2 + 1) ** 2 - 12) + 7)
+
+    side_measures, cell_measures = _launch_test_geometry_kernel(geo, device)
+
+    test.assertAlmostEqual(np.sum(cell_measures.numpy()), 4.0, places=4)
+    test.assertAlmostEqual(np.sum(side_measures.numpy()), 20 + 3.0, places=4)
+
+    # Test with non-graded geometry
+    ref_field = fem.ImplicitField(fem.Cells(geo), func=_refinement_field)
+    non_graded_geo = fem.adaptive_nanogrid_from_field(grid1, level_count=3, refinement_field=ref_field)
+    _launch_test_geometry_kernel(geo, device)
+
+    # Test automatic grading
+    graded_geo = fem.adaptive_nanogrid_from_field(grid1, level_count=3, refinement_field=ref_field, grading="face")
+    test.assertEqual(non_graded_geo.cell_count() + 7, graded_geo.cell_count())
 
 
 @integrand
@@ -1118,9 +1210,9 @@ def test_tri_shape_functions(test, device):
         b = param_delta[1]
         return param_delta, Coords(-a - b, a, b)
 
-    P_1 = shape.Triangle2DPolynomialShapeFunctions(degree=1)
-    P_2 = shape.Triangle2DPolynomialShapeFunctions(degree=2)
-    P_3 = shape.Triangle2DPolynomialShapeFunctions(degree=3)
+    P_1 = shape.TrianglePolynomialShapeFunctions(degree=1)
+    P_2 = shape.TrianglePolynomialShapeFunctions(degree=2)
+    P_3 = shape.TrianglePolynomialShapeFunctions(degree=3)
 
     test_shape_function_weight(test, P_1, tri_coord_sampler, TRI_CENTER_COORDS)
     test_shape_function_weight(test, P_2, tri_coord_sampler, TRI_CENTER_COORDS)
@@ -1132,9 +1224,9 @@ def test_tri_shape_functions(test, device):
     test_shape_function_gradient(test, P_2, tri_coord_sampler, tri_coord_delta_sampler)
     test_shape_function_gradient(test, P_3, tri_coord_sampler, tri_coord_delta_sampler)
 
-    P_1d = shape.Triangle2DNonConformingPolynomialShapeFunctions(degree=1)
-    P_2d = shape.Triangle2DNonConformingPolynomialShapeFunctions(degree=2)
-    P_3d = shape.Triangle2DNonConformingPolynomialShapeFunctions(degree=3)
+    P_1d = shape.TriangleNonConformingPolynomialShapeFunctions(degree=1)
+    P_2d = shape.TriangleNonConformingPolynomialShapeFunctions(degree=2)
+    P_3d = shape.TriangleNonConformingPolynomialShapeFunctions(degree=3)
 
     test_shape_function_weight(test, P_1d, tri_coord_sampler, TRI_CENTER_COORDS)
     test_shape_function_weight(test, P_2d, tri_coord_sampler, TRI_CENTER_COORDS)
@@ -1252,6 +1344,8 @@ def test_particle_quadratures(test, device):
     geo = fem.Grid2D(res=wp.vec2i(2))
 
     domain = fem.Cells(geo)
+
+    # Explicit quadrature
     points, weights = domain.reference_element().instantiate_quadrature(order=4, family=fem.Polynomial.GAUSS_LEGENDRE)
     points_per_cell = len(points)
 
@@ -1266,9 +1360,16 @@ def test_particle_quadratures(test, device):
     test.assertEqual(explicit_quadrature.max_points_per_element(), points_per_cell)
     test.assertEqual(explicit_quadrature.total_point_count(), points_per_cell * geo.cell_count())
 
+    # test integration accuracy
     val = fem.integrate(_bicubic, quadrature=explicit_quadrature)
     test.assertAlmostEqual(val, 1.0 / 16, places=5)
 
+    # test indexing validity
+    arr = wp.empty(explicit_quadrature.total_point_count(), dtype=float)
+    fem.interpolate(_piecewise_constant, dest=arr, quadrature=explicit_quadrature)
+    assert_np_equal(arr.numpy(), np.arange(geo.cell_count()).repeat(points_per_cell))
+
+    # PIC quadrature
     element_indices = wp.array([3, 3, 2], dtype=int, device=device)
     element_coords = wp.array(
         [
@@ -1286,6 +1387,7 @@ def test_particle_quadratures(test, device):
     test.assertEqual(pic_quadrature.total_point_count(), 3)
     test.assertEqual(pic_quadrature.active_cell_count(), 2)
 
+    # Test integration accuracy
     val = fem.integrate(_piecewise_constant, quadrature=pic_quadrature)
     test.assertAlmostEqual(val, 1.25, places=5)
 
@@ -1303,6 +1405,46 @@ def test_particle_quadratures(test, device):
 
     assert_np_equal(points.grad.numpy(), np.full((3, 2), 2.0))  # == 1.0 / cell_size
     assert_np_equal(measures.grad.numpy(), np.full(3, 4.0))  # == 1.0 / cell_area
+
+
+@fem.integrand
+def _value_at_node(s: fem.Sample, f: fem.Field, values: wp.array(dtype=float)):
+    node_index = fem.operator.node_partition_index(f, s.qp_index)
+    return values[node_index]
+
+
+def test_nodal_quadrature(test, device):
+    geo = fem.Grid2D(res=wp.vec2i(2))
+
+    domain = fem.Cells(geo)
+
+    space = fem.make_polynomial_space(geo, degree=2, discontinuous=True, family=fem.Polynomial.GAUSS_LEGENDRE)
+    nodal_quadrature = fem.NodalQuadrature(domain, space)
+
+    test.assertEqual(nodal_quadrature.max_points_per_element(), 9)
+    test.assertEqual(nodal_quadrature.total_point_count(), 9 * geo.cell_count())
+
+    val = fem.integrate(_bicubic, quadrature=nodal_quadrature)
+    test.assertAlmostEqual(val, 1.0 / 16, places=5)
+
+    # test accessing data associated to a given node
+
+    piecewise_constant_space = fem.make_polynomial_space(geo, degree=0)
+    geo_partition = fem.LinearGeometryPartition(geo, 3, 4)
+    space_partition = fem.make_space_partition(piecewise_constant_space, geo_partition)
+    field = fem.make_discrete_field(piecewise_constant_space, space_partition=space_partition)
+
+    partition_domain = fem.Cells(geo_partition)
+    partition_nodal_quadrature = fem.NodalQuadrature(partition_domain, piecewise_constant_space)
+
+    partition_node_values = wp.array([5.0], dtype=float)
+    val = fem.integrate(
+        _value_at_node,
+        quadrature=partition_nodal_quadrature,
+        fields={"f": field},
+        values={"values": partition_node_values},
+    )
+    test.assertAlmostEqual(val, 5.0 / geo.cell_count(), places=5)
 
 
 @wp.func
@@ -1394,7 +1536,7 @@ def test_implicit_fields(test, device):
 
 @wp.kernel
 def test_qr_eigenvalues():
-    tol = 1.0e-6
+    tol = 1.0e-8
 
     # zero
     Zero = wp.mat33(0.0)
@@ -1432,6 +1574,19 @@ def test_qr_eigenvalues():
     D4, P4 = symmetric_eigenvalues_qr(Rank4, tol * tol)
     Err4 = wp.transpose(P4) * wp.diag(D4) * P4 - Rank4
     wp.expect_near(wp.ddot(Err4, Err4), 0.0, tol)
+
+    # test robustness to low requested tolerance
+    Rank6 = mat66f(
+        vec6f(0.00171076, 0.0, 0.0, 0.0, 0.0, 0.0),
+        vec6f(0.0, 0.00169935, 6.14367e-06, -3.52589e-05, 3.02397e-05, -1.53458e-11),
+        vec6f(0.0, 6.14368e-06, 0.00172217, 2.03568e-05, 1.74589e-05, -2.92627e-05),
+        vec6f(0.0, -3.52589e-05, 2.03568e-05, 0.00172178, 2.53422e-05, 3.02397e-05),
+        vec6f(0.0, 3.02397e-05, 1.74589e-05, 2.53422e-05, 0.00171114, 3.52589e-05),
+        vec6f(0.0, 6.42993e-12, -2.92627e-05, 3.02397e-05, 3.52589e-05, 0.00169935),
+    )
+    D6, P6 = symmetric_eigenvalues_qr(Rank6, 0.0)
+    Err6 = wp.transpose(P6) * wp.diag(D6) * P6 - Rank6
+    wp.expect_near(wp.ddot(Err6, Err6), 0.0, 1.0e-13)
 
 
 @wp.kernel
@@ -1481,10 +1636,12 @@ add_function_test(TestFem, "test_grid_3d", test_grid_3d, devices=devices)
 add_function_test(TestFem, "test_tet_mesh", test_tet_mesh, devices=devices)
 add_function_test(TestFem, "test_hex_mesh", test_hex_mesh, devices=devices)
 add_function_test(TestFem, "test_nanogrid", test_nanogrid, devices=cuda_devices)
+add_function_test(TestFem, "test_adaptive_nanogrid", test_adaptive_nanogrid, devices=cuda_devices)
 add_function_test(TestFem, "test_deformed_geometry", test_deformed_geometry, devices=devices)
 add_function_test(TestFem, "test_dof_mapper", test_dof_mapper)
 add_function_test(TestFem, "test_point_basis", test_point_basis)
 add_function_test(TestFem, "test_particle_quadratures", test_particle_quadratures)
+add_function_test(TestFem, "test_nodal_quadrature", test_nodal_quadrature)
 add_function_test(TestFem, "test_implicit_fields", test_implicit_fields)
 add_kernel_test(TestFem, test_qr_eigenvalues, dim=1, devices=devices)
 add_kernel_test(TestFem, test_qr_inverse, dim=100, devices=devices)

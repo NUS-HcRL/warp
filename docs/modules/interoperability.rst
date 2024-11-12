@@ -418,7 +418,6 @@ Since this is an experimental feature, there are some limitations:
     - Kernel launch dimensions are inferred from the shape of the first argument.
     - Input arguments are followed by output arguments in the Warp kernel definition.
     - There must be at least one input argument and at least one output argument.
-    - Output shapes must match the launch dimensions (i.e., output shapes must match the shape of the first argument).
     - All arrays must be contiguous.
     - Only the CUDA backend is supported.
 
@@ -462,6 +461,233 @@ Here is an example of an operation with three inputs and two outputs::
     print(x)
     print(y)
 
+Using shardmap for distributed computation
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Warp can be used in conjunction with JAX's `shard_map <https://jax.readthedocs.io/en/latest/jep/14273-shard-map.html>`_ to perform distributed multi-GPU computations.
+
+To achieve this, the JAX distributed environment must be initialized (see `Distributed Arrays and Automatic Parallelization <https://jax.readthedocs.io/en/latest/notebooks/Distributed_arrays_and_automatic_parallelization.html>`_ for more details):
+
+.. code-block:: python
+
+    import jax
+    jax.distributed.initialize()
+
+This initialization must be called at the beginning of your program, before any other JAX operations.
+
+Here's an example of how to use `shard_map` with a Warp kernel:
+
+.. code-block:: python
+
+    import warp as wp
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import PartitionSpec as P
+    from jax.experimental.multihost_utils import process_allgather as allgather
+    from jax.experimental.shard_map import shard_map
+    from warp.jax_experimental import jax_kernel
+    import numpy as np
+
+    # Initialize JAX distributed environment
+    jax.distributed.initialize()
+    num_gpus = jax.device_count()
+
+    def print_on_process_0(*args, **kwargs):
+        if jax.process_index() == 0:
+            print(*args, **kwargs)
+
+    print_on_process_0(f"Running on {num_gpus} GPU(s)")
+
+    @wp.kernel
+    def multiply_by_two_kernel(
+        a_in: wp.array(dtype=wp.float32),
+        a_out: wp.array(dtype=wp.float32),
+    ):
+        index = wp.tid()
+        a_out[index] = a_in[index] * 2.0
+
+    jax_warp_multiply = jax_kernel(multiply_by_two_kernel)
+
+    def warp_multiply(x):
+        result = jax_warp_multiply(x)
+        return result
+
+        # a_in here is the full sharded array with shape (M,)
+        # The output will also be a sharded array with shape (M,)
+    def warp_distributed_operator(a_in):
+        def _sharded_operator(a_in):
+            # Inside the sharded operator, a_in is a local shard on each device
+            # If we have N devices and input size M, each shard has shape (M/N,)
+            
+            # warp_multiply applies the Warp kernel to the local shard
+            result = warp_multiply(a_in)[0]
+            
+            # result has the same shape as the input shard (M/N,)
+            return result
+
+        # shard_map distributes the computation across devices
+        return shard_map(
+            _sharded_operator,
+            mesh=jax.sharding.Mesh(np.array(jax.devices()), "x"),
+            in_specs=(P("x"),),  # Input is sharded along the 'x' axis
+            out_specs=P("x"),    # Output is also sharded along the 'x' axis
+            check_rep=False,
+        )(a_in)
+
+    print_on_process_0("Test distributed multiplication using JAX + Warp")
+
+    devices = jax.devices()
+    mesh = jax.sharding.Mesh(np.array(devices), "x")
+    sharding_spec = jax.sharding.NamedSharding(mesh, P("x"))
+
+    input_size = num_gpus * 5  # 5 elements per device
+    single_device_arrays = jnp.arange(input_size, dtype=jnp.float32)
+
+    # Define the shape of the input array based on the total input size
+    shape = (input_size,)
+
+    # Create a list of arrays by distributing the single_device_arrays across the available devices
+    # Each device will receive a portion of the input data
+    arrays = [
+        jax.device_put(single_device_arrays[index], d)  # Place each element on the corresponding device
+        for d, index in sharding_spec.addressable_devices_indices_map(shape).items()
+    ]
+
+    # Combine the individual device arrays into a single sharded array
+    sharded_array = jax.make_array_from_single_device_arrays(shape, sharding_spec, arrays)
+
+    # sharded_array has shape (input_size,) but is distributed across devices
+    print_on_process_0(f"Input array: {allgather(sharded_array)}")
+
+    # warp_result has the same shape and sharding as sharded_array
+    warp_result = warp_distributed_operator(sharded_array)
+
+    # allgather collects results from all devices, resulting in a full array of shape (input_size,)
+    print_on_process_0("Warp Output:", allgather(warp_result))
+
+In this example, `shard_map` is used to distribute the computation across available devices. The input array `a_in` is sharded along the 'x' axis, and each device processes its local shard. The Warp kernel `multiply_by_two_kernel` is applied to each shard, and the results are combined to form the final output.
+
+This approach allows for efficient parallel processing of large arrays, as each device works on a portion of the data simultaneously.
+
+To run this program on multiple GPUs, you must have OpenMPI installed. You can consult the `OpenMPI installation guide <https://docs.open-mpi.org/en/v5.0.x/installing-open-mpi/quickstart.html>`_ for instructions on how to install it. Once OpenMPI is installed, you can use `mpirun` with the following command:
+
+.. code-block:: bash
+
+    mpirun -np <NUM_OF_GPUS> python <filename>.py
+
+
+Specifying launch dimensions for matrix operations
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+In some cases, particularly for matrix operations, it's necessary to specify the launch dimensions for Warp kernels. This is because the default behavior of inferring dimensions from the first argument may not always be suitable for matrix operations. Here's an example of a distributed matrix multiplication using Warp and JAX:
+
+.. code-block:: python
+
+    import warp as wp
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import PartitionSpec as P
+    from jax.experimental.multihost_utils import process_allgather as allgather
+    from jax.experimental.shard_map import shard_map
+    from warp.jax_experimental import jax_kernel
+    import numpy as np
+
+    jax.distributed.initialize()
+    num_gpus = jax.device_count()
+
+    def print_on_process_0(*args, **kwargs):
+        if jax.process_index() == 0:
+            print(*args, **kwargs)
+
+    print_on_process_0(f"Running on {num_gpus} GPU(s)")
+
+    @wp.kernel
+    def matmul_kernel(
+        a: wp.array2d(dtype=wp.float32),
+        b: wp.array2d(dtype=wp.float32),
+        c: wp.array2d(dtype=wp.float32),
+    ):
+        # a: (M/num_gpus, K), b: (K, N), c: (M/num_gpus, N)
+        i, j = wp.tid()
+        M = a.shape[0]  # M/num_gpus
+        K = a.shape[1]  # K
+        N = b.shape[1]  # N
+        if i < M and j < N:
+            s = wp.float32(0.0)
+            for k in range(K):
+                s += a[i, k] * b[k, j]
+            c[i, j] = s
+
+    # Specify launch dimensions based on the number of GPUs
+    def create_jax_warp_matmul(M, N):
+        # M: total rows, N: total columns
+        block_size_m = M // num_gpus  # Rows per GPU
+        block_size_n = N  # All columns
+        return jax_kernel(matmul_kernel, launch_dims=(block_size_m, block_size_n))
+
+    def warp_distributed_matmul(a, b):
+        # a: (M, K) sharded across GPUs, b: (K, N) replicated
+        M, K = a.shape
+        _, N = b.shape
+        jax_warp_matmul = create_jax_warp_matmul(M, N)
+        
+        def _sharded_operator(a_shard, b):
+            # a_shard: (M/num_gpus, K), b: (K, N)
+            return jax_warp_matmul(a_shard, b)[0]  # Result: (M/num_gpus, N)
+
+        return shard_map(
+            _sharded_operator,
+            mesh=jax.sharding.Mesh(np.array(jax.devices()), "x"),
+            in_specs=(P("x", None), P(None, None)),  # a sharded in first dim, b replicated
+            out_specs=P("x", None),  # Output sharded in first dim
+            check_rep=False,
+        )(a, b)
+
+    print_on_process_0("Test distributed matrix multiplication using JAX + Warp")
+
+    # Define matrix dimensions
+    M = 8 * num_gpus  # Scale M with the number of devices
+    K, N = 4, 6
+
+    # Create input matrices
+    a = jnp.arange(M * K, dtype=jnp.float32).reshape(M, K)  # Shape: (M, K)
+    b = jnp.arange(K * N, dtype=jnp.float32).reshape(K, N)  # Shape: (K, N)
+
+    devices = jax.devices()
+    mesh = jax.sharding.Mesh(np.array(devices), "x")
+    sharding_spec_a = jax.sharding.NamedSharding(mesh, P("x", None))
+    sharding_spec_b = jax.sharding.NamedSharding(mesh, P(None, None))
+
+    # Shard matrix A and replicate matrix B
+    sharded_a = jax.device_put(a, sharding_spec_a)  # Sharded shape: (M/num_gpus, K) per device
+    replicated_b = jax.device_put(b, sharding_spec_b)  # Replicated shape: (K, N) on all devices
+
+    print_on_process_0(f"Input matrix A:\n{allgather(sharded_a)}")  # Shape: (M, K)
+    print_on_process_0(f"Input matrix B:\n{allgather(replicated_b)}")  # Shape: (K, N)
+
+    warp_result = warp_distributed_matmul(sharded_a, replicated_b)  # Sharded result: (M/num_gpus, N) per device
+    print_on_process_0("Warp Output:")
+    # Use allgather to collect results from all devices
+    print_on_process_0(allgather(warp_result))  # Shape: (M, N)
+
+    jax_result = jnp.matmul(a, b)  # Shape: (M, N)
+    print_on_process_0("JAX Output:")
+    print_on_process_0(jax_result)
+
+    expected_shape = (M, N)
+    print_on_process_0(f"Expected shape: {expected_shape}")
+    print_on_process_0(f"Warp output shape: {warp_result.shape}")  # Should be (M/num_gpus, N) on each device
+    print_on_process_0(f"JAX output shape: {jax_result.shape}")  # Should be (M, N)
+
+    allclose = jnp.allclose(allgather(warp_result), jax_result, atol=1e-5)
+    print_on_process_0(f"Allclose: {allclose}")
+
+In this example, we create a function `create_jax_warp_matmul` that calculates the launch dimensions based on the number of available GPUs. We use `jax.device_count()` to get the global number of GPUs and divide the `M` dimension (rows) of the matrix by this number. This ensures that each GPU processes an equal portion of the input matrix A. The `N` dimension (columns) remains unchanged as we're not sharding in that direction.
+
+Note that the launch dimensions are set to match the shape of the matrix portion on each GPU. The `block_size_m` is calculated by dividing the total number of rows by the number of GPUs, while `block_size_n` is set to the full width of the output matrix.
+
+Note that this is a naive implementation of matrix multiplication for the sake of this illustration, and there are many optimizations that can be made to improve performance.
+
 .. _DLPack:
 
 DLPack
@@ -483,6 +709,7 @@ The canonical way to export a Warp array to an external framework is to use the 
 
     jax_array = jax.dlpack.from_dlpack(warp_array)
     torch_tensor = torch.utils.dlpack.from_dlpack(warp_array)
+    paddle_tensor = paddle.utils.dlpack.from_dlpack(warp_array)
 
 For CUDA arrays, this will synchronize the current stream of the consumer framework with the current Warp stream on the array's device.
 Thus it should be safe to use the wrapped array in the consumer framework, even if the array was previously used in a Warp kernel
@@ -493,9 +720,11 @@ This approach may be used for older versions of frameworks that do not support t
 
     warp_array1 = wp.from_dlpack(jax.dlpack.to_dlpack(jax_array))
     warp_array2 = wp.from_dlpack(torch.utils.dlpack.to_dlpack(torch_tensor))
+    warp_array3 = wp.from_dlpack(paddle.utils.dlpack.to_dlpack(paddle_tensor))
 
     jax_array = jax.dlpack.from_dlpack(wp.to_dlpack(warp_array))
     torch_tensor = torch.utils.dlpack.from_dlpack(wp.to_dlpack(warp_array))
+    paddle_tensor = paddle.utils.dlpack.from_dlpack(wp.to_dlpack(warp_array))
 
 This approach is generally faster because it skips any stream synchronization, but another solution must be used to ensure correct
 ordering of operations.  In situations where no synchronization is required, using this approach can yield better performance.
@@ -507,3 +736,181 @@ This may be a good choice in situations like these:
 
 .. autofunction:: warp.from_dlpack
 .. autofunction:: warp.to_dlpack
+
+.. _paddle-interop:
+
+Paddle
+------
+
+Warp provides helper functions to convert arrays to/from Paddle::
+
+    w = wp.array([1.0, 2.0, 3.0], dtype=float, device="cpu")
+
+    # convert to Paddle tensor
+    t = wp.to_paddle(w)
+
+    # convert from Paddle tensor
+    w = wp.from_paddle(t)
+
+These helper functions allow the conversion of Warp arrays to/from Paddle tensors without copying the underlying data.
+At the same time, if available, gradient arrays and tensors are converted to/from Paddle autograd tensors, allowing the use of Warp arrays
+in Paddle autograd computations.
+
+.. autofunction:: warp.from_paddle
+.. autofunction:: warp.to_paddle
+.. autofunction:: warp.device_from_paddle
+.. autofunction:: warp.device_to_paddle
+.. autofunction:: warp.dtype_from_paddle
+.. autofunction:: warp.dtype_to_paddle
+
+To convert a Paddle CUDA stream to a Warp CUDA stream and vice versa, Warp provides the following functions:
+
+.. autofunction:: warp.stream_from_paddle
+
+Example: Optimization using ``warp.from_paddle()``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+An example usage of minimizing a loss function over an array of 2D points written in Warp via Paddle's Adam optimizer
+using :func:`warp.from_paddle` is as follows::
+
+    import warp as wp
+    import paddle
+
+    # init warp context at beginning
+    wp.context.init()
+
+    @wp.kernel()
+    def loss(xs: wp.array(dtype=float, ndim=2), l: wp.array(dtype=float)):
+        tid = wp.tid()
+        wp.atomic_add(l, 0, xs[tid, 0] ** 2.0 + xs[tid, 1] ** 2.0)
+
+    # indicate requires_grad so that Warp can accumulate gradients in the grad buffers
+    xs = paddle.randn([100, 2])
+    xs.stop_gradient = False
+    l = paddle.zeros([1])
+    l.stop_gradient = False
+    opt = paddle.optimizer.Adam(learning_rate=0.1, parameters=[xs])
+
+    wp_xs = wp.from_paddle(xs)
+    wp_l = wp.from_paddle(l)
+
+    tape = wp.Tape()
+    with tape:
+        # record the loss function kernel launch on the tape
+        wp.launch(loss, dim=len(xs), inputs=[wp_xs], outputs=[wp_l], device=wp_xs.device)
+
+    for i in range(500):
+        tape.zero()
+        tape.backward(loss=wp_l)  # compute gradients
+        # now xs.grad will be populated with the gradients computed by Warp
+        opt.step()  # update xs (and thereby wp_xs)
+
+        # these lines are only needed for evaluating the loss
+        # (the optimization just needs the gradient, not the loss value)
+        wp_l.zero_()
+        wp.launch(loss, dim=len(xs), inputs=[wp_xs], outputs=[wp_l], device=wp_xs.device)
+        print(f"{i}\tloss: {l.item()}")
+
+Example: Optimization using ``warp.to_paddle``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Less code is needed when we declare the optimization variables directly in Warp and use :func:`warp.to_paddle` to convert them to Paddle tensors.
+Here, we revisit the same example from above where now only a single conversion to a paddle tensor is needed to supply Adam with the optimization variables::
+
+    import warp as wp
+    import numpy as np
+    import paddle
+
+    # init warp context at beginning
+    wp.context.init()
+
+    @wp.kernel()
+    def loss(xs: wp.array(dtype=float, ndim=2), l: wp.array(dtype=float)):
+        tid = wp.tid()
+        wp.atomic_add(l, 0, xs[tid, 0] ** 2.0 + xs[tid, 1] ** 2.0)
+
+    # initialize the optimization variables in Warp
+    xs = wp.array(np.random.randn(100, 2), dtype=wp.float32, requires_grad=True)
+    l = wp.zeros(1, dtype=wp.float32, requires_grad=True)
+    # just a single wp.to_paddle call is needed, Adam optimizes using the Warp array gradients
+    opt = paddle.optimizer.Adam(learning_rate=0.1, parameters=[wp.to_paddle(xs)])
+
+    tape = wp.Tape()
+    with tape:
+        wp.launch(loss, dim=len(xs), inputs=[xs], outputs=[l], device=xs.device)
+
+    for i in range(500):
+        tape.zero()
+        tape.backward(loss=l)
+        opt.step()
+
+        l.zero_()
+        wp.launch(loss, dim=len(xs), inputs=[xs], outputs=[l], device=xs.device)
+        print(f"{i}\tloss: {l.numpy()[0]}")
+
+Performance Notes
+^^^^^^^^^^^^^^^^^
+
+The ``wp.from_paddle()`` function creates a Warp array object that shares data with a Paddle tensor.  Although this function does not copy the data, there is always some CPU overhead during the conversion.  If these conversions happen frequently, the overall program performance may suffer.  As a general rule, it's good to avoid repeated conversions of the same tensor.  Instead of:
+
+.. code:: python
+
+    x_t = paddle.arange(n, dtype=paddle.float32).to(device=wp.device_to_paddle(device))
+    y_t = paddle.ones([n], dtype=paddle.float32).to(device=wp.device_to_paddle(device))
+
+    for i in range(10):
+        x_w = wp.from_paddle(x_t)
+        y_w = wp.from_paddle(y_t)
+        wp.launch(saxpy, dim=n, inputs=[x_w, y_w, 1.0], device=device)
+
+Try converting the arrays only once and reuse them:
+
+.. code:: python
+
+    x_t = paddle.arange(n, dtype=paddle.float32).to(device=wp.device_to_paddle(device))
+    y_t = paddle.ones([n], dtype=paddle.float32).to(device=wp.device_to_paddle(device))
+
+    x_w = wp.from_paddle(x_t)
+    y_w = wp.from_paddle(y_t)
+
+    for i in range(10):
+        wp.launch(saxpy, dim=n, inputs=[x_w, y_w, 1.0], device=device)
+
+If reusing arrays is not possible (e.g., a new Paddle tensor is constructed on every iteration), passing ``return_ctype=True`` to ``wp.from_paddle()`` should yield faster performance.  Setting this argument to True avoids constructing a ``wp.array`` object and instead returns a low-level array descriptor.  This descriptor is a simple C structure that can be passed to Warp kernels instead of a ``wp.array``, but cannot be used in other places that require a ``wp.array``.
+
+.. code:: python
+
+    for n in range(1, 10):
+        # get Paddle tensors for this iteration
+        x_t = paddle.arange(n, dtype=paddle.float32).to(device=wp.device_to_paddle(device))
+        y_t = paddle.ones([n], dtype=paddle.float32).to(device=wp.device_to_paddle(device))
+
+        # get Warp array descriptors
+        x_ctype = wp.from_paddle(x_t, return_ctype=True)
+        y_ctype = wp.from_paddle(y_t, return_ctype=True)
+
+        wp.launch(saxpy, dim=n, inputs=[x_ctype, y_ctype, 1.0], device=device)
+
+An alternative approach is to pass the Paddle tensors to Warp kernels directly.  This avoids constructing temporary Warp arrays by leveraging standard array interfaces (like ``__cuda_array_interface__``) supported by both Paddle and Warp.  The main advantage of this approach is convenience, since there is no need to call any conversion functions.  The main limitation is that it does not handle gradients, because gradient information is not included in the standard array interfaces.  This technique is therefore most suitable for algorithms that do not involve differentiation.
+
+.. code:: python
+
+    x = paddle.arange(n, dtype=paddle.float32).to(device=wp.device_to_paddle(device))
+    y = paddle.ones([n], dtype=paddle.float32).to(device=wp.device_to_paddle(device))
+
+    for i in range(10):
+        wp.launch(saxpy, dim=n, inputs=[x, y, 1.0], device=device)
+
+.. code:: shell
+
+    python -m warp.examples.benchmarks.benchmark_interop_paddle
+
+Sample output:
+
+.. code::
+
+    13990 ms  from_paddle(...)
+     5990 ms  from_paddle(..., return_ctype=True)
+    35167 ms  direct from paddle
+
+The default ``wp.from_paddle()`` conversion is the slowest.  Passing ``return_ctype=True`` is the fastest, because it skips creating temporary Warp array objects.  Passing Paddle tensors to Warp kernels directly falls somewhere in between.  It skips creating temporary Warp arrays, but accessing the ``__cuda_array_interface__`` attributes of Paddle tensors adds overhead because they are initialized on-demand.

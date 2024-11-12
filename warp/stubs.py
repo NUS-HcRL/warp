@@ -11,9 +11,6 @@ Length = TypeVar("Length", bound=int)
 Rows = TypeVar("Rows", bound=int)
 Cols = TypeVar("Cols", bound=int)
 DType = TypeVar("DType")
-Int = TypeVar("Int")
-Float = TypeVar("Float")
-Scalar = TypeVar("Scalar")
 Vector = Generic[Length, Scalar]
 Matrix = Generic[Rows, Cols, Scalar]
 Quaternion = Generic[Float]
@@ -38,6 +35,8 @@ from warp.types import quat, quath, quatf, quatd
 from warp.types import transform, transformh, transformf, transformd
 from warp.types import spatial_vector, spatial_vectorh, spatial_vectorf, spatial_vectord
 from warp.types import spatial_matrix, spatial_matrixh, spatial_matrixf, spatial_matrixd
+
+from warp.types import Int, Float, Scalar
 
 from warp.types import Bvh, Mesh, HashGrid, Volume, MarchingCubes
 from warp.types import BvhQuery, HashGridQuery, MeshQueryAABB, MeshQueryPoint, MeshQueryRay
@@ -67,6 +66,7 @@ from warp.context import (
     copy,
     from_numpy,
     launch,
+    launch_tiled,
     synchronize,
     force_load,
     load_module,
@@ -108,11 +108,17 @@ from warp.jax import device_from_jax, device_to_jax
 
 from warp.dlpack import from_dlpack, to_dlpack
 
+from warp.paddle import from_paddle, to_paddle
+from warp.paddle import dtype_from_paddle, dtype_to_paddle
+from warp.paddle import device_from_paddle, device_to_paddle
+from warp.paddle import stream_from_paddle
+
 from warp.build import clear_kernel_cache
 
 from warp.constants import *
 
 from . import builtins
+from warp.builtins import static
 
 import warp.config as config
 
@@ -477,7 +483,7 @@ def cross(a: Vector[3, Scalar], b: Vector[3, Scalar]) -> Vector[3, Scalar]:
 
 
 @over
-def skew(vec: Vector[3, Scalar]):
+def skew(vec: Vector[3, Scalar]) -> Matrix[3, 3, Scalar]:
     """Compute the skew-symmetric 3x3 matrix for a 3D vector ``vec``."""
     ...
 
@@ -519,7 +525,7 @@ def normalize(a: Quaternion[Float]) -> Quaternion[Float]:
 
 
 @over
-def transpose(a: Matrix[Any, Any, Scalar]):
+def transpose(a: Matrix[Any, Any, Scalar]) -> Matrix[Any, Any, Scalar]:
     """Return the transpose of the matrix ``a``."""
     ...
 
@@ -603,6 +609,82 @@ def cw_div(a: Matrix[Any, Any, Scalar], b: Matrix[Any, Any, Scalar]) -> Matrix[A
 
 
 @over
+def vector(*args: Scalar, length: int32, dtype: Scalar) -> Vector[Any, Scalar]:
+    """Construct a vector of given length and dtype."""
+    ...
+
+
+@over
+def matrix(pos: Vector[3, Float], rot: Quaternion[Float], scale: Vector[3, Float], dtype: Float) -> Matrix[4, 4, Float]:
+    """Construct a 4x4 transformation matrix that applies the transformations as
+    Translation(pos)*Rotation(rot)*Scaling(scale) when applied to column vectors, i.e.: y = (TRS)*x
+    """
+    ...
+
+
+@over
+def matrix(*args: Scalar, shape: Tuple[int, int], dtype: Scalar) -> Matrix[Any, Any, Scalar]:
+    """Construct a matrix. If the positional ``arg_types`` are not given, then matrix will be zero-initialized."""
+    ...
+
+
+@over
+def identity(n: int32, dtype: Scalar) -> Matrix[Any, Any, Scalar]:
+    """Create an identity matrix with shape=(n,n) with the type given by ``dtype``."""
+    ...
+
+
+@over
+def svd3(A: Matrix[3, 3, Float], U: Matrix[3, 3, Float], sigma: Vector[3, Float], V: Matrix[3, 3, Scalar]):
+    """Compute the SVD of a 3x3 matrix ``A``. The singular values are returned in ``sigma``,
+    while the left and right basis vectors are returned in ``U`` and ``V``.
+    """
+    ...
+
+
+@over
+def qr3(A: Matrix[3, 3, Float], Q: Matrix[3, 3, Float], R: Matrix[3, 3, Float]):
+    """Compute the QR decomposition of a 3x3 matrix ``A``. The orthogonal matrix is returned in ``Q``,
+    while the upper triangular matrix is returned in ``R``.
+    """
+    ...
+
+
+@over
+def eig3(A: Matrix[3, 3, Float], Q: Matrix[3, 3, Float], d: Vector[3, Float]):
+    """Compute the eigendecomposition of a 3x3 matrix ``A``. The eigenvectors are returned as the columns of ``Q``,
+    while the corresponding eigenvalues are returned in ``d``.
+    """
+    ...
+
+
+@over
+def quaternion(dtype: Float) -> Quaternion[Float]:
+    """Construct a zero-initialized quaternion. Quaternions are laid out as
+    [ix, iy, iz, r], where ix, iy, iz are the imaginary part, and r the real part.
+    """
+    ...
+
+
+@over
+def quaternion(x: Float, y: Float, z: Float, w: Float) -> Quaternion[Float]:
+    """Create a quaternion using the supplied components (type inferred from component type)."""
+    ...
+
+
+@over
+def quaternion(ijk: Vector[3, Float], real: Float, dtype: Float) -> Quaternion[Float]:
+    """Create a quaternion using the supplied vector/scalar (type inferred from scalar type)."""
+    ...
+
+
+@over
+def quaternion(quat: Quaternion[Float], dtype: Float) -> Quaternion[Float]:
+    """Construct a quaternion of type dtype from another quaternion of a different dtype."""
+    ...
+
+
+@over
 def quat_identity(dtype: Float) -> quatf:
     """Construct an identity quaternion with zero imaginary part and real part of 1.0"""
     ...
@@ -663,6 +745,12 @@ def quat_to_matrix(quat: Quaternion[Float]) -> Matrix[3, 3, Float]:
 
 
 @over
+def transformation(pos: Vector[3, Float], rot: Quaternion[Float], dtype: Float) -> Transformation[Float]:
+    """Construct a rigid-body transformation with translation part ``pos`` and rotation ``rot``."""
+    ...
+
+
+@over
 def transform_identity(dtype: Float) -> transformf:
     """Construct an identity transform with zero translation and identity rotation."""
     ...
@@ -697,7 +785,8 @@ def transform_point(mat: Matrix[4, 4, Float], point: Vector[3, Float]) -> Vector
     """Apply the transform to a point ``point`` treating the homogeneous coordinate as w=1.
 
     The transformation is applied treating ``point`` as a column vector, e.g.: ``y = mat*point``.
-    Note this is in contrast to some libraries, notably USD, which applies transforms to row vectors, ``y^T = point^T*mat^T``.
+
+    This is in contrast to some libraries, notably USD, which applies transforms to row vectors, ``y^T = point^T*mat^T``.
     If the transform is coming from a library that uses row-vectors, then users should transpose the transformation
     matrix before calling this method.
     """
@@ -714,8 +803,9 @@ def transform_vector(xform: Transformation[Float], vec: Vector[3, Float]) -> Vec
 def transform_vector(mat: Matrix[4, 4, Float], vec: Vector[3, Float]) -> Vector[3, Float]:
     """Apply the transform to a vector ``vec`` treating the homogeneous coordinate as w=0.
 
-    The transformation is applied treating ``vec`` as a column vector, e.g.: ``y = mat*vec``
-    note this is in contrast to some libraries, notably USD, which applies transforms to row vectors, ``y^T = vec^T*mat^T``.
+    The transformation is applied treating ``vec`` as a column vector, e.g.: ``y = mat*vec``.
+
+    This is in contrast to some libraries, notably USD, which applies transforms to row vectors, ``y^T = vec^T*mat^T``.
     If the transform is coming from a library that uses row-vectors, then users should transpose the transformation
     matrix before calling this method.
     """
@@ -725,6 +815,30 @@ def transform_vector(mat: Matrix[4, 4, Float], vec: Vector[3, Float]) -> Vector[
 @over
 def transform_inverse(xform: Transformation[Float]) -> Transformation[Float]:
     """Compute the inverse of the transformation ``xform``."""
+    ...
+
+
+@over
+def spatial_vector(dtype: Float) -> Vector[6, Float]:
+    """Zero-initialize a 6D screw vector."""
+    ...
+
+
+@over
+def spatial_vector(w: Vector[3, Float], v: Vector[3, Float], dtype: Float) -> Vector[6, Float]:
+    """Construct a 6D screw vector from two 3D vectors."""
+    ...
+
+
+@over
+def spatial_vector(wx: Float, wy: Float, wz: Float, vx: Float, vy: Float, vz: Float, dtype: Float) -> Vector[6, Float]:
+    """Construct a 6D screw vector from six values."""
+    ...
+
+
+@over
+def spatial_adjoint(r: Matrix[3, 3, Float], s: Matrix[3, 3, Float]) -> Matrix[6, 6, Float]:
+    """Construct a 6x6 spatial inertial matrix from two 3x3 diagonal blocks."""
     ...
 
 
@@ -747,13 +861,13 @@ def spatial_cross_dual(a: Vector[6, Float], b: Vector[6, Float]) -> Vector[6, Fl
 
 
 @over
-def spatial_top(svec: Vector[6, Float]):
+def spatial_top(svec: Vector[6, Float]) -> Vector[3, Float]:
     """Return the top (first) part of a 6D screw vector."""
     ...
 
 
 @over
-def spatial_bottom(svec: Vector[6, Float]):
+def spatial_bottom(svec: Vector[6, Float]) -> Vector[3, Float]:
     """Return the bottom (second) part of a 6D screw vector."""
     ...
 
@@ -781,6 +895,449 @@ def spatial_mass(
 
 
 @over
+def tile_zeros(m: int32, n: int32, dtype: Scalar, storage: str) -> Tile:
+    """Allocates a tile of zero-initialized items.
+
+    :param m: Size of the first dimension of the output tile
+    :param n: Size of the second dimension of the output tile
+    :param dtype: Datatype of output tile's elements
+    :param storage: The storage location for the tile: ``"register"`` for registers
+      (default) or ``"shared"`` for shared memory.
+    :returns: A zero-initialized tile with ``shape=(m,n)`` and the specified datatype
+    """
+    ...
+
+
+@over
+def tile_ones(m: int32, n: int32, dtype: Scalar, storage: str) -> Tile:
+    """Allocates a tile of one-initialized items.
+
+    :param m: Size of the first dimension of the output tile
+    :param n: Size of the second dimension of the output tile
+    :param dtype: Datatype of output tile's elements
+    :param storage: The storage location for the tile: ``"register"`` for registers
+      (default) or ``"shared"`` for shared memory.
+    :returns: A one-initialized tile with ``shape=(m,n)`` and the specified dtype
+    """
+    ...
+
+
+@over
+def tile_arange(*args: Scalar, dtype: Scalar, storage: str) -> Tile:
+    """Generates a tile of linearly spaced elements.
+
+    :param args: Variable-length positional arguments, interpreted as:
+
+        - ``(stop,)``: Generates values from ``0`` to ``stop - 1``
+        - ``(start, stop)``: Generates values from ``start`` to ``stop - 1``
+        - ``(start, stop, step)``: Generates values from ``start`` to ``stop - 1`` with a step size
+
+    :param dtype: Datatype of output tile's elements (optional, default: int)
+    :param storage: The storage location for the tile: ``"register"`` for registers
+      (default) or ``"shared"`` for shared memory.
+    :returns: A tile with ``shape=(1,n)`` with linearly spaced elements of specified dtype
+    """
+    ...
+
+
+@over
+def tile_load(a: Array[Any], i: int32, n: int32, storage: str) -> Tile:
+    """Loads a 1D tile from a global memory array.
+
+    This method will cooperatively load a tile from global memory using all threads in the block.
+
+    :param a: The source array in global memory
+    :param i: Offset in the source array measured in multiples of ``n``, i.e.: ``offset=i*n``
+    :param n: The number of elements in the tile
+    :param storage: The storage location for the tile: ``"register"`` for registers
+      (default) or ``"shared"`` for shared memory.
+    :returns: A tile with ``shape=(1,n)`` and dtype the same as the source array
+    """
+    ...
+
+
+@over
+def tile_load(a: Array[Any], i: int32, j: int32, m: int32, n: int32, storage: str) -> Tile:
+    """Loads a 2D tile from a global memory array.
+
+    This method will cooperatively load a tile from global memory using all threads in the block.
+
+    :param a: The source array in global memory
+    :param i: Offset in the source array measured in multiples of ``m``, i.e.: ``row=i*m``
+    :param j: Offset in the source array measured in multiples of ``n``, i.e.; ``col=j*n``
+    :param m: The size of the tile's first dimension
+    :param n: The size of the tile's second dimension
+    :param storage: The storage location for the tile: ``"register"`` for registers
+      (default) or ``"shared"`` for shared memory.
+    :returns: A tile with ``shape=(m,n)`` and dtype the same as the source array
+    """
+    ...
+
+
+@over
+def tile_store(a: Array[Any], i: int32, t: Any):
+    """Stores a 1D tile to a global memory array.
+
+    This method will cooperatively store a tile to global memory using all threads in the block.
+
+    :param a: The destination array in global memory
+    :param i: Offset in the destination array measured in multiples of ``n``, i.e.: ``offset=i*n``
+    :param t: The source tile to store data from, must have the same dtype as the destination array
+    """
+    ...
+
+
+@over
+def tile_store(a: Array[Any], i: int32, j: int32, t: Any):
+    """Stores a tile to a global memory array.
+
+    This method will cooperatively store a tile to global memory using all threads in the block.
+
+    :param a: The destination array in global memory
+    :param i: Offset in the destination array measured in multiples of ``m``, i.e.: ``row=i*m``
+    :param j: Offset in the destination array measured in multiples of ``n``, i.e.; ``col=j*n``
+    :param t: The source tile to store data from, must have the same dtype as the destination array
+    """
+    ...
+
+
+@over
+def tile_atomic_add(a: Array[Any], x: int32, y: int32, t: Any) -> Tile:
+    """Atomically add a tile to the array `a`, each element will be updated atomically.
+
+    :param a: Array in global memory, should have the same ``dtype`` as the input tile
+    :param x: Offset in the destination array measured in multiples of ``m``, i.e.: ``i=x*M`` where ``M`` is the first tile dimension
+    :param y: Offset in the destination array measured in multiples of ``n``, i.e.: ``j=y*N`` where ``N`` is the second tile dimension
+    :param t: Source tile to add to the destination array
+    :returns: A tile with the same dimensions and type as the source tile, holding the original value of the destination elements
+    """
+    ...
+
+
+@over
+def tile(x: Any) -> Tile:
+    """Constructs a new Tile from per-thread kernel values.
+
+    This function converts values computed using scalar kernel code to a tile representation for input into collective operations.
+
+    * If the input value is a scalar, then the resulting tile has ``shape=(1, block_dim)``
+    * If the input value is a vector, then the resulting tile has ``shape=(length(vector), block_dim)``
+
+    :param x: A per-thread local value, e.g.: scalar, vector, or matrix.
+    :returns: A tile with first dimension according to the value type length and a second dimension equal to ``block_dim``
+
+    This example shows how to create a linear sequence from thread variables:
+
+    .. code-block:: python
+
+        @wp.kernel
+        def compute():
+            i = wp.tid()
+            t = wp.tile(i * 2)
+            print(t)
+
+
+        wp.launch(compute, dim=16, inputs=[], block_dim=16)
+
+    Prints:
+
+    .. code-block:: text
+
+        tile(m=1, n=16, storage=register) = [[0 2 4 6 8 ...]]
+
+
+    """
+    ...
+
+
+@over
+def untile(a: Any) -> Scalar:
+    """Convert a Tile back to per-thread values.
+
+    This function converts a block-wide tile back to per-thread values.
+
+    * If the input tile is 1-dimensional then the resulting value will be a per-thread scalar
+    * If the input tile is 2-dimensional then the resulting value will be a per-thread vector of length M
+
+    :param a: A tile with dimensions ``shape=(M, block_dim)``
+    :returns: A single value per-thread with the same dtype as the tile
+
+    This example shows how to create a linear sequence from thread variables:
+
+    .. code-block:: python
+
+        @wp.kernel
+        def compute():
+            i = wp.tid()
+
+            # create block-wide tile
+            t = wp.tile(i) * 2
+
+            # convert back to per-thread values
+            s = wp.untile()
+
+            print(s)
+
+
+        wp.launch(compute, dim=16, inputs=[], block_dim=16)
+
+    Prints:
+
+    .. code-block:: text
+
+        0
+        2
+        4
+        6
+        8
+        ...
+
+    """
+    ...
+
+
+@over
+def tile_extract(a: Tile, i: int32, j: int32) -> Scalar:
+    """Extracts a single element from the tile and returns it as a scalar type.
+
+    This function will extract an element from the tile and broadcast its value to all threads in the block.
+
+    Note that this may incur additional synchronization if the source tile is a register tile.
+
+    :param a: Tile to extract the element from
+    :param i: Coordinate of element on first dimension
+    :param j: Coordinate of element on the second dimension
+    :returns: The value of the element at the specified tile location, with the same type as the input tile's per-element dtype
+    """
+    ...
+
+
+@over
+def tile_transpose(a: Tile) -> Tile:
+    """Transpose a tile.
+
+    For shared memory tiles this operation will alias the input tile, register tiles will first be transferred to shared memory before transposition.
+
+    :param a: Tile to transpose with ``shape=(M,N)``
+    :returns: Tile with ``shape=(N,M)``
+    """
+    ...
+
+
+@over
+def tile_broadcast(a: Tile, m: int32, n: int32) -> Tile:
+    """Broadcast a tile.
+
+    This method will attempt to broadcast the input tile ``a`` to the destination shape (m, n), broadcasting follows NumPy broadcast rules.
+
+    :param a: Tile to broadcast
+    :returns: Tile with broadcast ``shape=(m, n)``
+    """
+    ...
+
+
+@over
+def tile_sum(a: Tile) -> Tile:
+    """Cooperatively compute the sum of the tile elements using all threads in the block.
+
+    :param a: The tile to compute the sum of
+    :returns: A single-element tile with dimensions of (1,1) holding the sum
+
+    Example:
+
+    .. code-block:: python
+
+        @wp.kernel
+        def compute():
+            t = wp.tile_ones(dtype=float, m=16, n=16)
+            s = wp.tile_sum(t)
+
+            print(t)
+
+
+        wp.launch(compute, dim=[64], inputs=[])
+
+    Prints:
+
+    .. code-block:: text
+
+        tile(m=1, n=1, storage=register) = [[256]]
+
+
+    """
+    ...
+
+
+@over
+def tile_min(a: Tile) -> Tile:
+    """Cooperatively compute the minimum of the tile elements using all threads in the block.
+
+    :param a: The tile to compute the minimum of
+    :returns: A single-element tile with dimensions of (1,1) holding the minimum value
+
+    Example:
+
+    .. code-block:: python
+
+        @wp.kernel
+        def compute():
+            t = wp.tile_arange(start=--10, stop=10, dtype=float)
+            s = wp.tile_min(t)
+
+            print(t)
+
+
+        wp.launch(compute, dim=[64], inputs=[])
+
+    Prints:
+
+    .. code-block:: text
+
+        tile(m=1, n=1, storage=register) = [[-10]]
+
+
+    """
+    ...
+
+
+@over
+def tile_max(a: Tile) -> Tile:
+    """Cooperatively compute the maximum of the tile elements using all threads in the block.
+
+    :param a: The tile to compute the maximum from
+    :returns: A single-element tile with dimensions of (1,1) holding the maximum value
+
+    Example:
+
+    .. code-block:: python
+
+        @wp.kernel
+        def compute():
+            t = wp.tile_arange(start=--10, stop=10, dtype=float)
+            s = wp.tile_min(t)
+
+            print(t)
+
+
+        wp.launch(compute, dim=[64], inputs=[])
+
+    Prints:
+
+    .. code-block:: text
+
+        tile(m=1, n=1, storage=register) = [[10]]
+
+
+    """
+    ...
+
+
+@over
+def tile_reduce(op: Callable, a: Any) -> Tile:
+    """Apply a custom reduction operator across the tile.
+
+    This function cooperatively performs a reduction using the provided operator across the tile.
+
+    :param op: A callable function that accepts two arguments and returns one argument, may be a user function or builtin
+    :param a: The input tile, the operator (or one of its overloads) must be able to accept the tile's dtype
+    :returns: A single-element tile with ``shape=(1,1)`` with the same datatype as the input tile.
+
+    Example:
+
+    .. code-block:: python
+
+        @wp.kernel
+        def factorial():
+            t = wp.tile_arange(1, 10, dtype=int)
+            s = wp.tile_reduce(wp.mul, t)
+
+            print(s)
+
+
+        wp.launch(factorial, dim=[16], inputs=[], block_dim=16)
+
+    Prints:
+
+    .. code-block:: text
+
+        tile(m=1, n=1, storage=register) = [[362880]]
+
+    """
+    ...
+
+
+@over
+def tile_map(op: Callable, a: Any) -> Tile:
+    """Apply a unary function onto the tile.
+
+    This function cooperatively applies a unary function to each element of the tile using all threads in the block.
+
+    :param op: A callable function that accepts one argument and returns one argument, may be a user function or builtin
+    :param a: The input tile, the operator (or one of its overloads) must be able to accept the tile's dtype
+    :returns: A tile with the same dimensions and datatype as the input tile.
+
+    Example:
+
+    .. code-block:: python
+
+        @wp.kernel
+        def compute():
+            t = wp.tile_arange(0.0, 1.0, 0.1, dtype=float)
+            s = wp.tile_map(wp.sin, t)
+
+            print(s)
+
+
+        wp.launch(compute, dim=[16], inputs=[])
+
+    Prints:
+
+    .. code-block:: text
+
+        tile(m=1, n=10, storage=register) = [[0 0.0998334 0.198669 0.29552 ...]]
+
+    """
+    ...
+
+
+@over
+def tile_map(op: Callable, a: Any, b: Any) -> Tile:
+    """Apply a binary function onto the tile.
+
+    This function cooperatively applies a binary function to each element of the tiles using all threads in the block.
+    Both input tiles must have the same dimensions and datatype.
+
+    :param op: A callable function that accepts two arguments and returns one argument, all of the same type, may be a user function or builtin
+    :param a: The first input tile, the operator (or one of its overloads) must be able to accept the tile's dtype
+    :param b: The second input tile, the operator (or one of its overloads) must be able to accept the tile's dtype
+    :returns: A tile with the same dimensions and datatype as the input tiles.
+
+    Example:
+
+    .. code-block:: python
+
+        @wp.kernel
+        def compute():
+            a = wp.tile_arange(0.0, 1.0, 0.1, dtype=float)
+            b = wp.tile_ones(m=1, n=10, dtype=float)
+
+            s = wp.tile_map(wp.add, a, b)
+
+            print(s)
+
+
+        wp.launch(compute, dim=[16], inputs=[])
+
+    Prints:
+
+    .. code-block:: text
+
+        tile(m=1, n=10, storage=register) = [[1 1.1 1.2 1.3 1.4 1.5 1.6 1.7 1.8 1.9]]
+    """
+    ...
+
+
+@over
 def mlp(
     weights: Array[float32],
     bias: Array[float32],
@@ -802,6 +1359,288 @@ def mlp(
     :note: Feature and output matrices are transposed compared to some other frameworks such as PyTorch.
            All matrices are assumed to be stored in flattened row-major memory layout (NumPy default).
     """
+    ...
+
+
+@over
+def bvh_query_aabb(id: uint64, low: vec3f, high: vec3f) -> bvh_query_t:
+    """Construct an axis-aligned bounding box query against a BVH object.
+
+    This query can be used to iterate over all bounds inside a BVH.
+
+    :param id: The BVH identifier
+    :param low: The lower bound of the bounding box in BVH space
+    :param high: The upper bound of the bounding box in BVH space
+    """
+    ...
+
+
+@over
+def bvh_query_ray(id: uint64, start: vec3f, dir: vec3f) -> bvh_query_t:
+    """Construct a ray query against a BVH object.
+
+    This query can be used to iterate over all bounds that intersect the ray.
+
+    :param id: The BVH identifier
+    :param start: The start of the ray in BVH space
+    :param dir: The direction of the ray in BVH space
+    """
+    ...
+
+
+@over
+def bvh_query_next(query: bvh_query_t, index: int32) -> bool:
+    """Move to the next bound returned by the query.
+    The index of the current bound is stored in ``index``, returns ``False`` if there are no more overlapping bound.
+    """
+    ...
+
+
+@over
+def mesh_query_point(id: uint64, point: vec3f, max_dist: float32) -> mesh_query_point_t:
+    """Computes the closest point on the :class:`Mesh` with identifier ``id`` to the given ``point`` in space.
+
+    Identifies the sign of the distance using additional ray-casts to determine if the point is inside or outside.
+    This method is relatively robust, but does increase computational cost.
+    See below for additional sign determination methods.
+
+    :param id: The mesh identifier
+    :param point: The point in space to query
+    :param max_dist: Mesh faces above this distance will not be considered by the query
+    """
+    ...
+
+
+@over
+def mesh_query_point_no_sign(id: uint64, point: vec3f, max_dist: float32) -> mesh_query_point_t:
+    """Computes the closest point on the :class:`Mesh` with identifier ``id`` to the given ``point`` in space.
+
+    This method does not compute the sign of the point (inside/outside) which makes it faster than other point query methods.
+
+    :param id: The mesh identifier
+    :param point: The point in space to query
+    :param max_dist: Mesh faces above this distance will not be considered by the query
+    """
+    ...
+
+
+@over
+def mesh_query_furthest_point_no_sign(id: uint64, point: vec3f, min_dist: float32) -> mesh_query_point_t:
+    """Computes the furthest point on the mesh with identifier `id` to the given point in space.
+
+    This method does not compute the sign of the point (inside/outside).
+
+    :param id: The mesh identifier
+    :param point: The point in space to query
+    :param min_dist: Mesh faces below this distance will not be considered by the query
+    """
+    ...
+
+
+@over
+def mesh_query_point_sign_normal(id: uint64, point: vec3f, max_dist: float32, epsilon: float32) -> mesh_query_point_t:
+    """Computes the closest point on the :class:`Mesh` with identifier ``id`` to the given ``point`` in space.
+
+    Identifies the sign of the distance (inside/outside) using the angle-weighted pseudo normal.
+    This approach to sign determination is robust for well conditioned meshes that are watertight and non-self intersecting.
+    It is also comparatively fast to compute.
+
+    :param id: The mesh identifier
+    :param point: The point in space to query
+    :param max_dist: Mesh faces above this distance will not be considered by the query
+    :param epsilon: Epsilon treating distance values as equal, when locating the minimum distance vertex/face/edge, as a
+                    fraction of the average edge length, also for treating closest point as being on edge/vertex default 1e-3
+    """
+    ...
+
+
+@over
+def mesh_query_point_sign_winding_number(
+    id: uint64, point: vec3f, max_dist: float32, accuracy: float32, threshold: float32
+) -> mesh_query_point_t:
+    """Computes the closest point on the :class:`Mesh` with identifier ``id`` to the given point in space.
+
+    Identifies the sign using the winding number of the mesh relative to the query point. This method of sign determination is robust for poorly conditioned meshes
+    and provides a smooth approximation to sign even when the mesh is not watertight. This method is the most robust and accurate of the sign determination meshes
+    but also the most expensive.
+
+    .. note:: The :class:`Mesh` object must be constructed with ``support_winding_number=True`` for this method to return correct results.
+
+    :param id: The mesh identifier
+    :param point: The point in space to query
+    :param max_dist: Mesh faces above this distance will not be considered by the query
+    :param accuracy: Accuracy for computing the winding number with fast winding number method utilizing second-order dipole approximation, default 2.0
+    :param threshold: The threshold of the winding number to be considered inside, default 0.5
+    """
+    ...
+
+
+@over
+def mesh_query_ray(id: uint64, start: vec3f, dir: vec3f, max_t: float32) -> mesh_query_ray_t:
+    """Computes the closest ray hit on the :class:`Mesh` with identifier ``id``.
+
+    :param id: The mesh identifier
+    :param start: The start point of the ray
+    :param dir: The ray direction (should be normalized)
+    :param max_t: The maximum distance along the ray to check for intersections
+    """
+    ...
+
+
+@over
+def mesh_query_aabb(id: uint64, low: vec3f, high: vec3f) -> mesh_query_aabb_t:
+    """Construct an axis-aligned bounding box query against a :class:`Mesh`.
+
+    This query can be used to iterate over all triangles inside a volume.
+
+    :param id: The mesh identifier
+    :param low: The lower bound of the bounding box in mesh space
+    :param high: The upper bound of the bounding box in mesh space
+    """
+    ...
+
+
+@over
+def mesh_query_aabb_next(query: mesh_query_aabb_t, index: int32) -> bool:
+    """Move to the next triangle overlapping the query bounding box.
+
+    The index of the current face is stored in ``index``, returns ``False`` if there are no more overlapping triangles.
+    """
+    ...
+
+
+@over
+def mesh_eval_position(id: uint64, face: int32, bary_u: float32, bary_v: float32) -> vec3f:
+    """Evaluates the position on the :class:`Mesh` given a face index and barycentric coordinates."""
+    ...
+
+
+@over
+def mesh_eval_velocity(id: uint64, face: int32, bary_u: float32, bary_v: float32) -> vec3f:
+    """Evaluates the velocity on the :class:`Mesh` given a face index and barycentric coordinates."""
+    ...
+
+
+@over
+def hash_grid_query(id: uint64, point: vec3f, max_dist: float32) -> hash_grid_query_t:
+    """Construct a point query against a :class:`HashGrid`.
+
+    This query can be used to iterate over all neighboring point within a fixed radius from the query point.
+    """
+    ...
+
+
+@over
+def hash_grid_query_next(query: hash_grid_query_t, index: int32) -> bool:
+    """Move to the next point in the hash grid query.
+
+    The index of the current neighbor is stored in ``index``, returns ``False`` if there are no more neighbors.
+    """
+    ...
+
+
+@over
+def hash_grid_point_id(id: uint64, index: int32) -> int:
+    """Return the index of a point in the :class:`HashGrid`.
+
+    This can be used to reorder threads such that grid traversal occurs in a spatially coherent order.
+
+    Returns -1 if the :class:`HashGrid` has not been reserved.
+    """
+    ...
+
+
+@over
+def intersect_tri_tri(v0: vec3f, v1: vec3f, v2: vec3f, u0: vec3f, u1: vec3f, u2: vec3f) -> int:
+    """Tests for intersection between two triangles (v0, v1, v2) and (u0, u1, u2) using Moller's method.
+
+    Returns > 0 if triangles intersect.
+    """
+    ...
+
+
+@over
+def mesh_get(id: uint64) -> Mesh:
+    """Retrieves the mesh given its index."""
+    ...
+
+
+@over
+def mesh_eval_face_normal(id: uint64, face: int32) -> vec3f:
+    """Evaluates the face normal the mesh given a face index."""
+    ...
+
+
+@over
+def mesh_get_point(id: uint64, index: int32) -> vec3f:
+    """Returns the point of the mesh given a index."""
+    ...
+
+
+@over
+def mesh_get_velocity(id: uint64, index: int32) -> vec3f:
+    """Returns the velocity of the mesh given a index."""
+    ...
+
+
+@over
+def mesh_get_index(id: uint64, index: int32) -> int:
+    """Returns the point-index of the mesh given a face-vertex index."""
+    ...
+
+
+@over
+def closest_point_edge_edge(p1: vec3f, q1: vec3f, p2: vec3f, q2: vec3f, epsilon: float32) -> vec3f:
+    """Finds the closest points between two edges.
+
+    Returns barycentric weights to the points on each edge, as well as the closest distance between the edges.
+
+    :param p1: First point of first edge
+    :param q1: Second point of first edge
+    :param p2: First point of second edge
+    :param q2: Second point of second edge
+    :param epsilon: Zero tolerance for determining if points in an edge are degenerate.
+    :param out: vec3 output containing (s,t,d), where `s` in [0,1] is the barycentric weight for the first edge, `t` is the barycentric weight for the second edge, and `d` is the distance between the two edges at these two closest points.
+    """
+    ...
+
+
+@over
+def reversed(range: range_t) -> range_t:
+    """Returns the range in reversed order."""
+    ...
+
+
+@over
+def volume_sample(id: uint64, uvw: vec3f, sampling_mode: int32, dtype: Any) -> Any:
+    """Sample the volume of type `dtype` given by ``id`` at the volume local-space point ``uvw``.
+
+    Interpolation should be :attr:`warp.Volume.CLOSEST` or :attr:`wp.Volume.LINEAR.`
+    """
+    ...
+
+
+@over
+def volume_sample_grad(id: uint64, uvw: vec3f, sampling_mode: int32, grad: Any, dtype: Any) -> Any:
+    """Sample the volume given by ``id`` and its gradient at the volume local-space point ``uvw``.
+
+    Interpolation should be :attr:`warp.Volume.CLOSEST` or :attr:`wp.Volume.LINEAR.`
+    """
+    ...
+
+
+@over
+def volume_lookup(id: uint64, i: int32, j: int32, k: int32, dtype: Any) -> Any:
+    """Returns the value of voxel with coordinates ``i``, ``j``, ``k`` for a volume of type type `dtype`.
+
+    If the voxel at this index does not exist, this function returns the background value.
+    """
+    ...
+
+
+@over
+def volume_store(id: uint64, i: int32, j: int32, k: int32, value: Any):
+    """Store ``value`` at the voxel with coordinates ``i``, ``j``, ``k``."""
     ...
 
 
@@ -880,6 +1719,32 @@ def volume_lookup_i(id: uint64, i: int32, j: int32, k: int32) -> int:
 @over
 def volume_store_i(id: uint64, i: int32, j: int32, k: int32, value: int32):
     """Store ``value`` at the voxel with coordinates ``i``, ``j``, ``k``."""
+    ...
+
+
+@over
+def volume_sample_index(id: uint64, uvw: vec3f, sampling_mode: int32, voxel_data: Array[Any], background: Any) -> Any:
+    """Sample the volume given by ``id`` at the volume local-space point ``uvw``.
+
+    Values for allocated voxels are read from the ``voxel_data`` array, and `background` is used as the value of non-existing voxels.
+    Interpolation should be :attr:`warp.Volume.CLOSEST` or :attr:`wp.Volume.LINEAR`.
+    This function is available for both index grids and classical volumes.
+
+    """
+    ...
+
+
+@over
+def volume_sample_grad_index(
+    id: uint64, uvw: vec3f, sampling_mode: int32, voxel_data: Array[Any], background: Any, grad: Any
+) -> Any:
+    """Sample the volume given by ``id`` and its gradient at the volume local-space point ``uvw``.
+
+    Values for allocated voxels are read from the ``voxel_data`` array, and `background` is used as the value of non-existing voxels.
+    Interpolation should be :attr:`warp.Volume.CLOSEST` or :attr:`wp.Volume.LINEAR`.
+    This function is available for both index grids and classical volumes.
+
+    """
     ...
 
 
@@ -1107,6 +1972,30 @@ def printf(fmt: str, *args: Any):
 
 
 @over
+def print(value: Any):
+    """Print variable to stdout"""
+    ...
+
+
+@over
+def breakpoint():
+    """Debugger breakpoint"""
+    ...
+
+
+@over
+def tid() -> int:
+    """Return the current thread index for a 1D kernel launch.
+
+    Note that this is the *global* index of the thread in the range [0, dim)
+    where dim is the parameter passed to kernel launch.
+
+    This function may not be called from user-defined Warp functions.
+    """
+    ...
+
+
+@over
 def tid() -> Tuple[int, int]:
     """Return the current thread indices for a 2D kernel launch.
 
@@ -1140,421 +2029,421 @@ def tid() -> Tuple[int, int, int, int]:
 
 
 @over
-def select(cond: bool, value_if_false: Any, value_if_true: Any):
+def select(cond: bool, value_if_false: Any, value_if_true: Any) -> Any:
     """Select between two arguments, if ``cond`` is ``False`` then return ``value_if_false``, otherwise return ``value_if_true``"""
     ...
 
 
 @over
-def select(cond: int8, value_if_false: Any, value_if_true: Any):
+def select(cond: int8, value_if_false: Any, value_if_true: Any) -> Any:
     """Select between two arguments, if ``cond`` is ``False`` then return ``value_if_false``, otherwise return ``value_if_true``"""
     ...
 
 
 @over
-def select(cond: uint8, value_if_false: Any, value_if_true: Any):
+def select(cond: uint8, value_if_false: Any, value_if_true: Any) -> Any:
     """Select between two arguments, if ``cond`` is ``False`` then return ``value_if_false``, otherwise return ``value_if_true``"""
     ...
 
 
 @over
-def select(cond: int16, value_if_false: Any, value_if_true: Any):
+def select(cond: int16, value_if_false: Any, value_if_true: Any) -> Any:
     """Select between two arguments, if ``cond`` is ``False`` then return ``value_if_false``, otherwise return ``value_if_true``"""
     ...
 
 
 @over
-def select(cond: uint16, value_if_false: Any, value_if_true: Any):
+def select(cond: uint16, value_if_false: Any, value_if_true: Any) -> Any:
     """Select between two arguments, if ``cond`` is ``False`` then return ``value_if_false``, otherwise return ``value_if_true``"""
     ...
 
 
 @over
-def select(cond: int32, value_if_false: Any, value_if_true: Any):
+def select(cond: int32, value_if_false: Any, value_if_true: Any) -> Any:
     """Select between two arguments, if ``cond`` is ``False`` then return ``value_if_false``, otherwise return ``value_if_true``"""
     ...
 
 
 @over
-def select(cond: uint32, value_if_false: Any, value_if_true: Any):
+def select(cond: uint32, value_if_false: Any, value_if_true: Any) -> Any:
     """Select between two arguments, if ``cond`` is ``False`` then return ``value_if_false``, otherwise return ``value_if_true``"""
     ...
 
 
 @over
-def select(cond: int64, value_if_false: Any, value_if_true: Any):
+def select(cond: int64, value_if_false: Any, value_if_true: Any) -> Any:
     """Select between two arguments, if ``cond`` is ``False`` then return ``value_if_false``, otherwise return ``value_if_true``"""
     ...
 
 
 @over
-def select(cond: uint64, value_if_false: Any, value_if_true: Any):
+def select(cond: uint64, value_if_false: Any, value_if_true: Any) -> Any:
     """Select between two arguments, if ``cond`` is ``False`` then return ``value_if_false``, otherwise return ``value_if_true``"""
     ...
 
 
 @over
-def select(arr: Array[Any], value_if_false: Any, value_if_true: Any):
+def select(arr: Array[Any], value_if_false: Any, value_if_true: Any) -> Any:
     """Select between two arguments, if ``arr`` is null then return ``value_if_false``, otherwise return ``value_if_true``"""
     ...
 
 
 @over
-def atomic_add(arr: Array[Any], i: int32, value: Any):
-    """Atomically add ``value`` onto ``arr[i]``."""
+def atomic_add(arr: Array[Any], i: Int, value: Any) -> Any:
+    """Atomically add ``value`` onto ``arr[i]`` and return the old value."""
     ...
 
 
 @over
-def atomic_add(arr: Array[Any], i: int32, j: int32, value: Any):
-    """Atomically add ``value`` onto ``arr[i,j]``."""
+def atomic_add(arr: Array[Any], i: Int, j: Int, value: Any) -> Any:
+    """Atomically add ``value`` onto ``arr[i,j]`` and return the old value."""
     ...
 
 
 @over
-def atomic_add(arr: Array[Any], i: int32, j: int32, k: int32, value: Any):
-    """Atomically add ``value`` onto ``arr[i,j,k]``."""
+def atomic_add(arr: Array[Any], i: Int, j: Int, k: Int, value: Any) -> Any:
+    """Atomically add ``value`` onto ``arr[i,j,k]`` and return the old value."""
     ...
 
 
 @over
-def atomic_add(arr: Array[Any], i: int32, j: int32, k: int32, l: int32, value: Any):
-    """Atomically add ``value`` onto ``arr[i,j,k,l]``."""
+def atomic_add(arr: Array[Any], i: Int, j: Int, k: Int, l: Int, value: Any) -> Any:
+    """Atomically add ``value`` onto ``arr[i,j,k,l]`` and return the old value."""
     ...
 
 
 @over
-def atomic_add(arr: FabricArray[Any], i: int32, value: Any):
-    """Atomically add ``value`` onto ``arr[i]``."""
+def atomic_add(arr: FabricArray[Any], i: Int, value: Any) -> Any:
+    """Atomically add ``value`` onto ``arr[i]`` and return the old value."""
     ...
 
 
 @over
-def atomic_add(arr: FabricArray[Any], i: int32, j: int32, value: Any):
-    """Atomically add ``value`` onto ``arr[i,j]``."""
+def atomic_add(arr: FabricArray[Any], i: Int, j: Int, value: Any) -> Any:
+    """Atomically add ``value`` onto ``arr[i,j]`` and return the old value."""
     ...
 
 
 @over
-def atomic_add(arr: FabricArray[Any], i: int32, j: int32, k: int32, value: Any):
-    """Atomically add ``value`` onto ``arr[i,j,k]``."""
+def atomic_add(arr: FabricArray[Any], i: Int, j: Int, k: Int, value: Any) -> Any:
+    """Atomically add ``value`` onto ``arr[i,j,k]`` and return the old value."""
     ...
 
 
 @over
-def atomic_add(arr: FabricArray[Any], i: int32, j: int32, k: int32, l: int32, value: Any):
-    """Atomically add ``value`` onto ``arr[i,j,k,l]``."""
+def atomic_add(arr: FabricArray[Any], i: Int, j: Int, k: Int, l: Int, value: Any) -> Any:
+    """Atomically add ``value`` onto ``arr[i,j,k,l]`` and return the old value."""
     ...
 
 
 @over
-def atomic_add(arr: IndexedFabricArray[Any], i: int32, value: Any):
-    """Atomically add ``value`` onto ``arr[i]``."""
+def atomic_add(arr: IndexedFabricArray[Any], i: Int, value: Any) -> Any:
+    """Atomically add ``value`` onto ``arr[i]`` and return the old value."""
     ...
 
 
 @over
-def atomic_add(arr: IndexedFabricArray[Any], i: int32, j: int32, value: Any):
-    """Atomically add ``value`` onto ``arr[i,j]``."""
+def atomic_add(arr: IndexedFabricArray[Any], i: Int, j: Int, value: Any) -> Any:
+    """Atomically add ``value`` onto ``arr[i,j]`` and return the old value."""
     ...
 
 
 @over
-def atomic_add(arr: IndexedFabricArray[Any], i: int32, j: int32, k: int32, value: Any):
-    """Atomically add ``value`` onto ``arr[i,j,k]``."""
+def atomic_add(arr: IndexedFabricArray[Any], i: Int, j: Int, k: Int, value: Any) -> Any:
+    """Atomically add ``value`` onto ``arr[i,j,k]`` and return the old value."""
     ...
 
 
 @over
-def atomic_add(arr: IndexedFabricArray[Any], i: int32, j: int32, k: int32, l: int32, value: Any):
-    """Atomically add ``value`` onto ``arr[i,j,k,l]``."""
+def atomic_add(arr: IndexedFabricArray[Any], i: Int, j: Int, k: Int, l: Int, value: Any) -> Any:
+    """Atomically add ``value`` onto ``arr[i,j,k,l]`` and return the old value."""
     ...
 
 
 @over
-def atomic_sub(arr: Array[Any], i: int32, value: Any):
-    """Atomically subtract ``value`` onto ``arr[i]``."""
+def atomic_sub(arr: Array[Any], i: Int, value: Any) -> Any:
+    """Atomically subtract ``value`` onto ``arr[i]`` and return the old value."""
     ...
 
 
 @over
-def atomic_sub(arr: Array[Any], i: int32, j: int32, value: Any):
-    """Atomically subtract ``value`` onto ``arr[i,j]``."""
+def atomic_sub(arr: Array[Any], i: Int, j: Int, value: Any) -> Any:
+    """Atomically subtract ``value`` onto ``arr[i,j]`` and return the old value."""
     ...
 
 
 @over
-def atomic_sub(arr: Array[Any], i: int32, j: int32, k: int32, value: Any):
-    """Atomically subtract ``value`` onto ``arr[i,j,k]``."""
+def atomic_sub(arr: Array[Any], i: Int, j: Int, k: Int, value: Any) -> Any:
+    """Atomically subtract ``value`` onto ``arr[i,j,k]`` and return the old value."""
     ...
 
 
 @over
-def atomic_sub(arr: Array[Any], i: int32, j: int32, k: int32, l: int32, value: Any):
-    """Atomically subtract ``value`` onto ``arr[i,j,k,l]``."""
+def atomic_sub(arr: Array[Any], i: Int, j: Int, k: Int, l: Int, value: Any) -> Any:
+    """Atomically subtract ``value`` onto ``arr[i,j,k,l]`` and return the old value."""
     ...
 
 
 @over
-def atomic_sub(arr: FabricArray[Any], i: int32, value: Any):
-    """Atomically subtract ``value`` onto ``arr[i]``."""
+def atomic_sub(arr: FabricArray[Any], i: Int, value: Any) -> Any:
+    """Atomically subtract ``value`` onto ``arr[i]`` and return the old value."""
     ...
 
 
 @over
-def atomic_sub(arr: FabricArray[Any], i: int32, j: int32, value: Any):
-    """Atomically subtract ``value`` onto ``arr[i,j]``."""
+def atomic_sub(arr: FabricArray[Any], i: Int, j: Int, value: Any) -> Any:
+    """Atomically subtract ``value`` onto ``arr[i,j]`` and return the old value."""
     ...
 
 
 @over
-def atomic_sub(arr: FabricArray[Any], i: int32, j: int32, k: int32, value: Any):
-    """Atomically subtract ``value`` onto ``arr[i,j,k]``."""
+def atomic_sub(arr: FabricArray[Any], i: Int, j: Int, k: Int, value: Any) -> Any:
+    """Atomically subtract ``value`` onto ``arr[i,j,k]`` and return the old value."""
     ...
 
 
 @over
-def atomic_sub(arr: FabricArray[Any], i: int32, j: int32, k: int32, l: int32, value: Any):
-    """Atomically subtract ``value`` onto ``arr[i,j,k,l]``."""
+def atomic_sub(arr: FabricArray[Any], i: Int, j: Int, k: Int, l: Int, value: Any) -> Any:
+    """Atomically subtract ``value`` onto ``arr[i,j,k,l]`` and return the old value."""
     ...
 
 
 @over
-def atomic_sub(arr: IndexedFabricArray[Any], i: int32, value: Any):
-    """Atomically subtract ``value`` onto ``arr[i]``."""
+def atomic_sub(arr: IndexedFabricArray[Any], i: Int, value: Any) -> Any:
+    """Atomically subtract ``value`` onto ``arr[i]`` and return the old value."""
     ...
 
 
 @over
-def atomic_sub(arr: IndexedFabricArray[Any], i: int32, j: int32, value: Any):
-    """Atomically subtract ``value`` onto ``arr[i,j]``."""
+def atomic_sub(arr: IndexedFabricArray[Any], i: Int, j: Int, value: Any) -> Any:
+    """Atomically subtract ``value`` onto ``arr[i,j]`` and return the old value."""
     ...
 
 
 @over
-def atomic_sub(arr: IndexedFabricArray[Any], i: int32, j: int32, k: int32, value: Any):
-    """Atomically subtract ``value`` onto ``arr[i,j,k]``."""
+def atomic_sub(arr: IndexedFabricArray[Any], i: Int, j: Int, k: Int, value: Any) -> Any:
+    """Atomically subtract ``value`` onto ``arr[i,j,k]`` and return the old value."""
     ...
 
 
 @over
-def atomic_sub(arr: IndexedFabricArray[Any], i: int32, j: int32, k: int32, l: int32, value: Any):
-    """Atomically subtract ``value`` onto ``arr[i,j,k,l]``."""
+def atomic_sub(arr: IndexedFabricArray[Any], i: Int, j: Int, k: Int, l: Int, value: Any) -> Any:
+    """Atomically subtract ``value`` onto ``arr[i,j,k,l]`` and return the old value."""
     ...
 
 
 @over
-def atomic_min(arr: Array[Any], i: int32, value: Any):
-    """Compute the minimum of ``value`` and ``arr[i]`` and atomically update the array.
+def atomic_min(arr: Array[Any], i: Int, value: Any) -> Any:
+    """Compute the minimum of ``value`` and ``arr[i]``, atomically update the array, and return the old value.
 
-    .. note:: The operation is only atomic on a per-component basis for vectors and matrices.
+    The operation is only atomic on a per-component basis for vectors and matrices.
     """
     ...
 
 
 @over
-def atomic_min(arr: Array[Any], i: int32, j: int32, value: Any):
-    """Compute the minimum of ``value`` and ``arr[i,j]`` and atomically update the array.
+def atomic_min(arr: Array[Any], i: Int, j: Int, value: Any) -> Any:
+    """Compute the minimum of ``value`` and ``arr[i,j]``, atomically update the array, and return the old value.
 
-    .. note:: The operation is only atomic on a per-component basis for vectors and matrices.
+    The operation is only atomic on a per-component basis for vectors and matrices.
     """
     ...
 
 
 @over
-def atomic_min(arr: Array[Any], i: int32, j: int32, k: int32, value: Any):
-    """Compute the minimum of ``value`` and ``arr[i,j,k]`` and atomically update the array.
+def atomic_min(arr: Array[Any], i: Int, j: Int, k: Int, value: Any) -> Any:
+    """Compute the minimum of ``value`` and ``arr[i,j,k]``, atomically update the array, and return the old value.
 
-    .. note:: The operation is only atomic on a per-component basis for vectors and matrices.
+    The operation is only atomic on a per-component basis for vectors and matrices.
     """
     ...
 
 
 @over
-def atomic_min(arr: Array[Any], i: int32, j: int32, k: int32, l: int32, value: Any):
-    """Compute the minimum of ``value`` and ``arr[i,j,k,l]`` and atomically update the array.
+def atomic_min(arr: Array[Any], i: Int, j: Int, k: Int, l: Int, value: Any) -> Any:
+    """Compute the minimum of ``value`` and ``arr[i,j,k,l]``, atomically update the array, and return the old value.
 
-    .. note:: The operation is only atomic on a per-component basis for vectors and matrices.
+    The operation is only atomic on a per-component basis for vectors and matrices.
     """
     ...
 
 
 @over
-def atomic_min(arr: FabricArray[Any], i: int32, value: Any):
-    """Compute the minimum of ``value`` and ``arr[i]`` and atomically update the array.
+def atomic_min(arr: FabricArray[Any], i: Int, value: Any) -> Any:
+    """Compute the minimum of ``value`` and ``arr[i]``, atomically update the array, and return the old value.
 
-    .. note:: The operation is only atomic on a per-component basis for vectors and matrices.
+    The operation is only atomic on a per-component basis for vectors and matrices.
     """
     ...
 
 
 @over
-def atomic_min(arr: FabricArray[Any], i: int32, j: int32, value: Any):
-    """Compute the minimum of ``value`` and ``arr[i,j]`` and atomically update the array.
+def atomic_min(arr: FabricArray[Any], i: Int, j: Int, value: Any) -> Any:
+    """Compute the minimum of ``value`` and ``arr[i,j]``, atomically update the array, and return the old value.
 
-    .. note:: The operation is only atomic on a per-component basis for vectors and matrices.
+    The operation is only atomic on a per-component basis for vectors and matrices.
     """
     ...
 
 
 @over
-def atomic_min(arr: FabricArray[Any], i: int32, j: int32, k: int32, value: Any):
-    """Compute the minimum of ``value`` and ``arr[i,j,k]`` and atomically update the array.
+def atomic_min(arr: FabricArray[Any], i: Int, j: Int, k: Int, value: Any) -> Any:
+    """Compute the minimum of ``value`` and ``arr[i,j,k]``, atomically update the array, and return the old value.
 
-    .. note:: The operation is only atomic on a per-component basis for vectors and matrices.
+    The operation is only atomic on a per-component basis for vectors and matrices.
     """
     ...
 
 
 @over
-def atomic_min(arr: FabricArray[Any], i: int32, j: int32, k: int32, l: int32, value: Any):
-    """Compute the minimum of ``value`` and ``arr[i,j,k,l]`` and atomically update the array.
+def atomic_min(arr: FabricArray[Any], i: Int, j: Int, k: Int, l: Int, value: Any) -> Any:
+    """Compute the minimum of ``value`` and ``arr[i,j,k,l]``, atomically update the array, and return the old value.
 
-    .. note:: The operation is only atomic on a per-component basis for vectors and matrices.
+    The operation is only atomic on a per-component basis for vectors and matrices.
     """
     ...
 
 
 @over
-def atomic_min(arr: IndexedFabricArray[Any], i: int32, value: Any):
-    """Compute the minimum of ``value`` and ``arr[i]`` and atomically update the array.
+def atomic_min(arr: IndexedFabricArray[Any], i: Int, value: Any) -> Any:
+    """Compute the minimum of ``value`` and ``arr[i]``, atomically update the array, and return the old value.
 
-    .. note:: The operation is only atomic on a per-component basis for vectors and matrices.
+    The operation is only atomic on a per-component basis for vectors and matrices.
     """
     ...
 
 
 @over
-def atomic_min(arr: IndexedFabricArray[Any], i: int32, j: int32, value: Any):
-    """Compute the minimum of ``value`` and ``arr[i,j]`` and atomically update the array.
+def atomic_min(arr: IndexedFabricArray[Any], i: Int, j: Int, value: Any) -> Any:
+    """Compute the minimum of ``value`` and ``arr[i,j]``, atomically update the array, and return the old value.
 
-    .. note:: The operation is only atomic on a per-component basis for vectors and matrices.
+    The operation is only atomic on a per-component basis for vectors and matrices.
     """
     ...
 
 
 @over
-def atomic_min(arr: IndexedFabricArray[Any], i: int32, j: int32, k: int32, value: Any):
-    """Compute the minimum of ``value`` and ``arr[i,j,k]`` and atomically update the array.
+def atomic_min(arr: IndexedFabricArray[Any], i: Int, j: Int, k: Int, value: Any) -> Any:
+    """Compute the minimum of ``value`` and ``arr[i,j,k]``, atomically update the array, and return the old value.
 
-    .. note:: The operation is only atomic on a per-component basis for vectors and matrices.
+    The operation is only atomic on a per-component basis for vectors and matrices.
     """
     ...
 
 
 @over
-def atomic_min(arr: IndexedFabricArray[Any], i: int32, j: int32, k: int32, l: int32, value: Any):
-    """Compute the minimum of ``value`` and ``arr[i,j,k,l]`` and atomically update the array.
+def atomic_min(arr: IndexedFabricArray[Any], i: Int, j: Int, k: Int, l: Int, value: Any) -> Any:
+    """Compute the minimum of ``value`` and ``arr[i,j,k,l]``, atomically update the array, and return the old value.
 
-    .. note:: The operation is only atomic on a per-component basis for vectors and matrices.
+    The operation is only atomic on a per-component basis for vectors and matrices.
     """
     ...
 
 
 @over
-def atomic_max(arr: Array[Any], i: int32, value: Any):
-    """Compute the maximum of ``value`` and ``arr[i]`` and atomically update the array.
+def atomic_max(arr: Array[Any], i: Int, value: Any) -> Any:
+    """Compute the maximum of ``value`` and ``arr[i]``, atomically update the array, and return the old value.
 
-    .. note:: The operation is only atomic on a per-component basis for vectors and matrices.
+    The operation is only atomic on a per-component basis for vectors and matrices.
     """
     ...
 
 
 @over
-def atomic_max(arr: Array[Any], i: int32, j: int32, value: Any):
-    """Compute the maximum of ``value`` and ``arr[i,j]`` and atomically update the array.
+def atomic_max(arr: Array[Any], i: Int, j: Int, value: Any) -> Any:
+    """Compute the maximum of ``value`` and ``arr[i,j]``, atomically update the array, and return the old value.
 
-    .. note:: The operation is only atomic on a per-component basis for vectors and matrices.
+    The operation is only atomic on a per-component basis for vectors and matrices.
     """
     ...
 
 
 @over
-def atomic_max(arr: Array[Any], i: int32, j: int32, k: int32, value: Any):
-    """Compute the maximum of ``value`` and ``arr[i,j,k]`` and atomically update the array.
+def atomic_max(arr: Array[Any], i: Int, j: Int, k: Int, value: Any) -> Any:
+    """Compute the maximum of ``value`` and ``arr[i,j,k]``, atomically update the array, and return the old value.
 
-    .. note:: The operation is only atomic on a per-component basis for vectors and matrices.
+    The operation is only atomic on a per-component basis for vectors and matrices.
     """
     ...
 
 
 @over
-def atomic_max(arr: Array[Any], i: int32, j: int32, k: int32, l: int32, value: Any):
-    """Compute the maximum of ``value`` and ``arr[i,j,k,l]`` and atomically update the array.
+def atomic_max(arr: Array[Any], i: Int, j: Int, k: Int, l: Int, value: Any) -> Any:
+    """Compute the maximum of ``value`` and ``arr[i,j,k,l]``, atomically update the array, and return the old value.
 
-    .. note:: The operation is only atomic on a per-component basis for vectors and matrices.
+    The operation is only atomic on a per-component basis for vectors and matrices.
     """
     ...
 
 
 @over
-def atomic_max(arr: FabricArray[Any], i: int32, value: Any):
-    """Compute the maximum of ``value`` and ``arr[i]`` and atomically update the array.
+def atomic_max(arr: FabricArray[Any], i: Int, value: Any) -> Any:
+    """Compute the maximum of ``value`` and ``arr[i]``, atomically update the array, and return the old value.
 
-    .. note:: The operation is only atomic on a per-component basis for vectors and matrices.
+    The operation is only atomic on a per-component basis for vectors and matrices.
     """
     ...
 
 
 @over
-def atomic_max(arr: FabricArray[Any], i: int32, j: int32, value: Any):
-    """Compute the maximum of ``value`` and ``arr[i,j]`` and atomically update the array.
+def atomic_max(arr: FabricArray[Any], i: Int, j: Int, value: Any) -> Any:
+    """Compute the maximum of ``value`` and ``arr[i,j]``, atomically update the array, and return the old value.
 
-    .. note:: The operation is only atomic on a per-component basis for vectors and matrices.
+    The operation is only atomic on a per-component basis for vectors and matrices.
     """
     ...
 
 
 @over
-def atomic_max(arr: FabricArray[Any], i: int32, j: int32, k: int32, value: Any):
-    """Compute the maximum of ``value`` and ``arr[i,j,k]`` and atomically update the array.
+def atomic_max(arr: FabricArray[Any], i: Int, j: Int, k: Int, value: Any) -> Any:
+    """Compute the maximum of ``value`` and ``arr[i,j,k]``, atomically update the array, and return the old value.
 
-    .. note:: The operation is only atomic on a per-component basis for vectors and matrices.
+    The operation is only atomic on a per-component basis for vectors and matrices.
     """
     ...
 
 
 @over
-def atomic_max(arr: FabricArray[Any], i: int32, j: int32, k: int32, l: int32, value: Any):
-    """Compute the maximum of ``value`` and ``arr[i,j,k,l]`` and atomically update the array.
+def atomic_max(arr: FabricArray[Any], i: Int, j: Int, k: Int, l: Int, value: Any) -> Any:
+    """Compute the maximum of ``value`` and ``arr[i,j,k,l]``, atomically update the array, and return the old value.
 
-    .. note:: The operation is only atomic on a per-component basis for vectors and matrices.
+    The operation is only atomic on a per-component basis for vectors and matrices.
     """
     ...
 
 
 @over
-def atomic_max(arr: IndexedFabricArray[Any], i: int32, value: Any):
-    """Compute the maximum of ``value`` and ``arr[i]`` and atomically update the array.
+def atomic_max(arr: IndexedFabricArray[Any], i: Int, value: Any) -> Any:
+    """Compute the maximum of ``value`` and ``arr[i]``, atomically update the array, and return the old value.
 
-    .. note:: The operation is only atomic on a per-component basis for vectors and matrices.
+    The operation is only atomic on a per-component basis for vectors and matrices.
     """
     ...
 
 
 @over
-def atomic_max(arr: IndexedFabricArray[Any], i: int32, j: int32, value: Any):
-    """Compute the maximum of ``value`` and ``arr[i,j]`` and atomically update the array.
+def atomic_max(arr: IndexedFabricArray[Any], i: Int, j: Int, value: Any) -> Any:
+    """Compute the maximum of ``value`` and ``arr[i,j]``, atomically update the array, and return the old value.
 
-    .. note:: The operation is only atomic on a per-component basis for vectors and matrices.
+    The operation is only atomic on a per-component basis for vectors and matrices.
     """
     ...
 
 
 @over
-def atomic_max(arr: IndexedFabricArray[Any], i: int32, j: int32, k: int32, value: Any):
-    """Compute the maximum of ``value`` and ``arr[i,j,k]`` and atomically update the array.
+def atomic_max(arr: IndexedFabricArray[Any], i: Int, j: Int, k: Int, value: Any) -> Any:
+    """Compute the maximum of ``value`` and ``arr[i,j,k]``, atomically update the array, and return the old value.
 
-    .. note:: The operation is only atomic on a per-component basis for vectors and matrices.
+    The operation is only atomic on a per-component basis for vectors and matrices.
     """
     ...
 
 
 @over
-def atomic_max(arr: IndexedFabricArray[Any], i: int32, j: int32, k: int32, l: int32, value: Any):
-    """Compute the maximum of ``value`` and ``arr[i,j,k,l]`` and atomically update the array.
+def atomic_max(arr: IndexedFabricArray[Any], i: Int, j: Int, k: Int, l: Int, value: Any) -> Any:
+    """Compute the maximum of ``value`` and ``arr[i,j,k,l]``, atomically update the array, and return the old value.
 
-    .. note:: The operation is only atomic on a per-component basis for vectors and matrices.
+    The operation is only atomic on a per-component basis for vectors and matrices.
     """
     ...
 
@@ -1648,6 +2537,12 @@ def add(a: Matrix[Any, Any, Scalar], b: Matrix[Any, Any, Scalar]) -> Matrix[Any,
 @over
 def add(a: Transformation[Scalar], b: Transformation[Scalar]) -> Transformation[Scalar]:
     """ """
+    ...
+
+
+@over
+def add(a: Tile, b: Tile) -> Tile:
+    """Add each element of two tiles together"""
     ...
 
 
@@ -1778,7 +2673,7 @@ def mul(a: Vector[Any, Scalar], b: Matrix[Any, Any, Scalar]) -> Vector[Any, Scal
 
 
 @over
-def mul(a: Matrix[Any, Any, Scalar], b: Matrix[Any, Any, Scalar]):
+def mul(a: Matrix[Any, Any, Scalar], b: Matrix[Any, Any, Scalar]) -> Matrix[Any, Any, Scalar]:
     """ """
     ...
 
@@ -1802,8 +2697,26 @@ def mul(a: Transformation[Scalar], b: Scalar) -> Transformation[Scalar]:
 
 
 @over
+def mul(x: Tile, y: Scalar) -> Tile:
+    """Multiply each element of a tile by a scalar"""
+    ...
+
+
+@over
+def mul(x: Scalar, y: Tile) -> Tile:
+    """Multiply each element of a tile by a scalar"""
+    ...
+
+
+@over
 def mod(a: Scalar, b: Scalar) -> Scalar:
-    """ """
+    """Modulo operation using truncated division."""
+    ...
+
+
+@over
+def mod(a: Vector[Any, Scalar], b: Vector[Any, Scalar]) -> Scalar:
+    """Modulo operation using truncated division."""
     ...
 
 
@@ -1904,6 +2817,12 @@ def neg(x: Matrix[Any, Any, Scalar]) -> Matrix[Any, Any, Scalar]:
 
 
 @over
+def neg(x: Tile) -> Tile:
+    """Negate each element of a tile"""
+    ...
+
+
+@over
 def unot(a: bool) -> bool:
     """ """
     ...
@@ -1960,4 +2879,84 @@ def unot(a: uint64) -> bool:
 @over
 def unot(a: Array[Any]) -> bool:
     """ """
+    ...
+
+
+@over
+def tile_matmul(a: Tile, b: Tile, out: Tile) -> Tile:
+    """Computes the matrix product and accumulates ``out += a*b``.
+
+    Supported datatypes are:
+        * fp16, fp32, fp64 (real)
+        * vec2h, vec2f, vec2d (complex)
+
+    All input and output tiles must have the same datatype. Tile data will be automatically be migrated
+    to shared memory if necessary and will use TensorCore operations when available.
+
+    :param a: A tile with ``shape=(M, K)``
+    :param b: A tile with ``shape=(K, N)``
+    :param out: A tile with ``shape=(M, N)``
+
+    """
+    ...
+
+
+@over
+def tile_matmul(a: Tile, b: Tile) -> Tile:
+    """Computes the matrix product ``out = a*b``.
+
+    Supported datatypes are:
+        * fp16, fp32, fp64 (real)
+        * vec2h, vec2f, vec2d (complex)
+
+    Both input tiles must have the same datatype. Tile data will be automatically be migrated
+    to shared memory if necessary and will use TensorCore operations when available.
+
+    :param a: A tile with ``shape=(M, K)``
+    :param b: A tile with ``shape=(K, N)``
+    :returns: A tile with ``shape=(M, N)``
+
+    """
+    ...
+
+
+@over
+def tile_fft(inout: Tile) -> Tile:
+    """Compute the forward FFT along the second dimension of a 2D tile of data.
+
+    This function cooperatively computes the forward FFT on a tile of data inplace, treating each row individually.
+
+    Supported datatypes are:
+        * vec2f, vec2d
+
+    :param inout: The input/output tile
+    """
+    ...
+
+
+@over
+def tile_ifft(inout: Tile) -> Tile:
+    """Compute the inverse FFT along the second dimension of a 2D tile of data.
+
+    This function cooperatively computes the inverse FFT on a tile of data inplace, treating each row individually.
+
+    Supported datatypes are:
+        * vec2f, vec2d
+
+    :param inout: The input/output tile
+    """
+    ...
+
+
+@over
+def static(expr: Any) -> Any:
+    """Evaluates a static Python expression and replaces it with its result.
+
+    See the :ref:`code generation guide <static_expressions>` for more details.
+
+    The inner expression must only reference variables that are available from the current scope where the Warp kernel or function containing the expression is defined,
+    which includes constant variables and variables captured in the current closure in which the function or kernel is implemented.
+    The return type of the expression must be either a Warp function, a string, or a type that is supported inside Warp kernels and functions
+    (excluding Warp arrays since they cannot be created in a Warp kernel at the moment).
+    """
     ...

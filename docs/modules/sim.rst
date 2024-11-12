@@ -1,3 +1,5 @@
+:tocdepth: 3
+
 warp.sim
 ========
 
@@ -161,6 +163,9 @@ Integrators
     :members:
 
 .. autoclass:: FeatherstoneIntegrator
+    :members:
+
+.. autoclass:: VBDIntegrator
     :members:
 
 Importers

@@ -1,3 +1,5 @@
+.. _differentiability:
+
 Differentiability
 =================
 
@@ -174,6 +176,7 @@ When we run simulations independently in parallel, the Jacobian corresponding to
         
         tape.zero()
 
+.. _custom-gradient-functions:
 
 Custom Gradient Functions
 #########################
@@ -775,9 +778,11 @@ In the example above we can see that the array ``c`` does not have its ``require
 Array Overwrite Tracking
 ^^^^^^^^^^^^^^^^^^^^^^^^^
 
-It is a common mistake to inadvertently overwrite an array that participates in the computation graph. For example::
+It is a common mistake to inadvertently overwrite an array that participates in the computation graph. For example:
 
-    with tape as wp.Tape():
+.. code-block:: python
+
+    with wp.Tape() as tape:
 
         # step 1
         wp.launch(compute_forces, dim=n, inputs=[pos0, vel0], outputs=[force])
@@ -788,7 +793,7 @@ It is a common mistake to inadvertently overwrite an array that participates in 
         wp.launch(simulate, dim=n, inputs=[pos1, vel1, force], outputs=[pos2, vel2])
 
         # compute loss
-        wp.launch(loss, dim=n, inputs=[pos2])
+        wp.launch(compute_loss, dim=n, inputs=[pos2], outputs=[loss])
 
     tape.backward(loss)
 
@@ -872,7 +877,7 @@ it is marked as having been read from. Later, if the same array is passed to a k
     Setting ``wp.config.verify_autograd_array_access = True`` will disable kernel caching and force the current module to rebuild.
 
 .. note::
-    Though in-place operations such as ``x[tid] += 1.0`` are technically ``read -> write``, the Warp graph specifically accomodates adjoint accumulation in these cases, so we mark them as write operations.
+    Though in-place operations such as ``x[tid] += 1.0`` are technically ``read -> write``, the Warp graph specifically accommodates adjoint accumulation in these cases, so we mark them as write operations.
 
 .. note::
     This feature does not yet support arrays packed in Warp structs.
@@ -887,6 +892,34 @@ Limitations and Workarounds
 Warp uses a source-code transformation approach to auto-differentiation.
 In this approach, the backwards pass must keep a record of intermediate values computed during the forward pass.
 This imposes some restrictions on what kernels can do if they are to remain differentiable.
+
+In-Place Math Operations
+^^^^^^^^^^^^^^^^^^^^^^^^
+
+In-place addition and subtraction can be used in kernels participating in the backward pass, e.g.
+
+.. code-block:: python
+
+    @wp.kernel
+    def inplace(a: wp.array(dtype=float), b: wp.array(dtype=float)):
+        i = wp.tid()
+
+        a[i] -= b[i]
+
+
+    a = wp.full(10, value=10.0, dtype=float, requires_grad=True)
+    b = wp.full(10, value=2.0, dtype=float, requires_grad=True)
+
+    with wp.Tape() as tape:
+        wp.launch(inplace, a.shape, inputs=[a, b])
+
+    tape.backward(grads={a: wp.ones_like(a)})
+
+    print(a.grad)  # [1. 1. 1. 1. 1. 1. 1. 1. 1. 1.]
+    print(b.grad)  # [-1. -1. -1. -1. -1. -1. -1. -1. -1. -1.]
+
+In-place multiplication and division are *not* supported and incorrect results will be obtained in the backward pass.
+A warning will be emitted during code generation if ``wp.config.verbose = True``.
 
 Dynamic Loops
 ^^^^^^^^^^^^^

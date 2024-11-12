@@ -25,6 +25,11 @@ def fn():
 @wp.func
 def fn(value: int):
     wp.print(value)
+
+@wp.kernel
+def k():
+    print(fn())
+    print(fn(99))
 """
 
 # should be same hash as FUNC_OVERLOAD_1
@@ -38,6 +43,11 @@ def fn():
 @wp.func
 def fn(value: int):
     wp.print(value)
+
+@wp.kernel
+def k():
+    print(fn())
+    print(fn(99))
 """
 
 # should be different hash than FUNC_OVERLOAD_1 (first overload is different)
@@ -51,6 +61,11 @@ def fn():
 @wp.func
 def fn(value: int):
     wp.print(value)
+
+@wp.kernel
+def k():
+    print(fn())
+    print(fn(99))
 """
 
 # should be different hash than FUNC_OVERLOAD_1 (second overload is different)
@@ -64,6 +79,11 @@ def fn():
 @wp.func
 def fn(value: int):
     wp.print(value + 1)
+
+@wp.kernel
+def k():
+    print(fn())
+    print(fn(99))
 """
 
 FUNC_GENERIC_1 = """# -*- coding: utf-8 -*-
@@ -78,6 +98,11 @@ def generic_fn(x: Any):
 @wp.func
 def generic_fn(x: Any, y: Any):
     return x * y
+
+@wp.kernel
+def k():
+    print(generic_fn(17))
+    print(generic_fn(17, 42))
 """
 
 # should be same hash as FUNC_GENERIC_1
@@ -93,6 +118,11 @@ def generic_fn(x: Any):
 @wp.func
 def generic_fn(x: Any, y: Any):
     return x * y
+
+@wp.kernel
+def k():
+    print(generic_fn(17))
+    print(generic_fn(17, 42))
 """
 
 # should be different hash than FUNC_GENERIC_1 (first overload is different)
@@ -108,6 +138,11 @@ def generic_fn(x: Any):
 @wp.func
 def generic_fn(x: Any, y: Any):
     return x * y
+
+@wp.kernel
+def k():
+    print(generic_fn(17))
+    print(generic_fn(17, 42))
 """
 
 # should be different hash than FUNC_GENERIC_1 (second overload is different)
@@ -123,6 +158,11 @@ def generic_fn(x: Any):
 @wp.func
 def generic_fn(x: Any, y: Any):
     return x + y
+
+@wp.kernel
+def k():
+    print(generic_fn(17))
+    print(generic_fn(17, 42))
 """
 
 
@@ -174,12 +214,35 @@ def test_function_generic_overload_hashing(test, device):
     test.assertNotEqual(hash4, hash1)
 
 
+SIMPLE_MODULE = """# -*- coding: utf-8 -*-
+import warp as wp
+
+@wp.kernel
+def k():
+    pass
+"""
+
+
+def test_module_load(test, device):
+    """Ensure that loading a module does not change its hash"""
+    m = load_code_as_module(SIMPLE_MODULE, "simple_module")
+
+    hash1 = m.hash_module()
+    m.load(device)
+    hash2 = m.hash_module()
+
+    test.assertEqual(hash1, hash2)
+
+
 class TestModuleHashing(unittest.TestCase):
     pass
 
 
+devices = get_test_devices()
+
 add_function_test(TestModuleHashing, "test_function_overload_hashing", test_function_overload_hashing)
 add_function_test(TestModuleHashing, "test_function_generic_overload_hashing", test_function_generic_overload_hashing)
+add_function_test(TestModuleHashing, "test_module_load", test_module_load, devices=devices)
 
 
 if __name__ == "__main__":

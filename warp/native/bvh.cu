@@ -65,7 +65,7 @@ __global__ void bvh_refit_kernel(int n, const int* __restrict__ parents, int* __
             int finished = atomicAdd(&child_count[parent], 1);
 
             // if we have are the last thread (such that the parent node is now complete)
-            // then update its bounds and move onto the the next parent in the hierarchy
+            // then update its bounds and move onto the next parent in the hierarchy
             if (finished == 1)
             {
                 const int left_child = node_lowers[parent].i;
@@ -273,7 +273,7 @@ __global__ void build_hierarchy(int n, int* root, const int* __restrict__ deltas
             }
 
             // if we have are the last thread (such that the parent node is now complete)
-            // then update its bounds and move onto the the next parent in the hierarchy
+            // then update its bounds and move onto the next parent in the hierarchy
             if (childCount == 1)
             {
                 const int left_child = lowers[parent].i;
@@ -463,7 +463,9 @@ void bvh_create_device(void* context, vec3* lowers, vec3* uppers, int num_items,
     bvh_host.num_items = num_items;
     bvh_host.max_nodes = 2*num_items;
     bvh_host.node_lowers = (BVHPackedNodeHalf*)alloc_device(WP_CURRENT_CONTEXT, sizeof(BVHPackedNodeHalf)*bvh_host.max_nodes);
+    memset_device(WP_CURRENT_CONTEXT, bvh_host.node_lowers, 0, sizeof(BVHPackedNodeHalf)*bvh_host.max_nodes);
     bvh_host.node_uppers = (BVHPackedNodeHalf*)alloc_device(WP_CURRENT_CONTEXT, sizeof(BVHPackedNodeHalf)*bvh_host.max_nodes);
+    memset_device(WP_CURRENT_CONTEXT, bvh_host.node_uppers, 0, sizeof(BVHPackedNodeHalf)*bvh_host.max_nodes);
     bvh_host.node_parents = (int*)alloc_device(WP_CURRENT_CONTEXT, sizeof(int)*bvh_host.max_nodes);
     bvh_host.node_counts = (int*)alloc_device(WP_CURRENT_CONTEXT, sizeof(int)*bvh_host.max_nodes);
     bvh_host.root = (int*)alloc_device(WP_CURRENT_CONTEXT, sizeof(int));

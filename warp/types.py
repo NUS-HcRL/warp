@@ -66,8 +66,8 @@ def constant(x):
         x: Compile-time constant value, can be any of the built-in math types.
     """
 
-    if not isinstance(x, (builtins.bool, int, float, tuple(scalar_and_bool_types), ctypes.Array)):
-        raise RuntimeError(f"Invalid constant type: {type(x)}")
+    if not is_value(x):
+        raise TypeError(f"Invalid constant type: {type(x)}")
 
     return x
 
@@ -100,8 +100,10 @@ def vector(length, dtype):
 
         if dtype is bool:
             _type_ = ctypes.c_bool
-        elif dtype in [Scalar, Float]:
+        elif dtype in (Scalar, Float):
             _type_ = ctypes.c_float
+        elif dtype is Int:
+            _type_ = ctypes.c_int
         else:
             _type_ = dtype._type_
 
@@ -237,6 +239,12 @@ def vector(length, dtype):
         def __rtruediv__(self, x):
             return warp.div(x, self)
 
+        def __mod__(self, x):
+            return warp.mod(self, x)
+
+        def __rmod__(self, x):
+            return warp.mod(x, self)
+
         def __pos__(self):
             return warp.pos(self)
 
@@ -283,8 +291,10 @@ def matrix(shape, dtype):
 
         if dtype is bool:
             _type_ = ctypes.c_bool
-        elif dtype in [Scalar, Float]:
+        elif dtype in (Scalar, Float):
             _type_ = ctypes.c_float
+        elif dtype is Int:
+            _type_ = ctypes.c_int
         else:
             _type_ = dtype._type_
 
@@ -518,6 +528,12 @@ class scalar_base:
 
     def __rtruediv__(self, x):
         return warp.div(x, self)
+
+    def __mod__(self, x):
+        return warp.mod(self, x)
+
+    def __rmod__(self, x):
+        return warp.mod(x, self)
 
     def __pos__(self):
         return warp.pos(self)
@@ -979,6 +995,43 @@ vector_types = (
     spatial_matrixd,
 )
 
+atomic_vector_types = (
+    vec2i,
+    vec2ui,
+    vec2l,
+    vec2ul,
+    vec2h,
+    vec2f,
+    vec2d,
+    vec3i,
+    vec3ui,
+    vec3l,
+    vec3ul,
+    vec3h,
+    vec3f,
+    vec3d,
+    vec4i,
+    vec4ui,
+    vec4l,
+    vec4ul,
+    vec4h,
+    vec4f,
+    vec4d,
+    mat22h,
+    mat22f,
+    mat22d,
+    mat33h,
+    mat33f,
+    mat33d,
+    mat44h,
+    mat44f,
+    mat44d,
+    quath,
+    quatf,
+    quatd,
+)
+atomic_types = float_types + (int32, uint32, int64, uint64) + atomic_vector_types
+
 np_dtype_to_warp_type = {
     # Numpy scalar types
     np.bool_: bool,
@@ -1253,7 +1306,7 @@ def type_to_warp(dtype):
 
 def type_typestr(dtype):
     if dtype == bool:
-        return "?"
+        return "|b1"
     elif dtype == float16:
         return "<f2"
     elif dtype == float32:
@@ -1261,9 +1314,9 @@ def type_typestr(dtype):
     elif dtype == float64:
         return "<f8"
     elif dtype == int8:
-        return "b"
+        return "|i1"
     elif dtype == uint8:
-        return "B"
+        return "|u1"
     elif dtype == int16:
         return "<i2"
     elif dtype == uint16:
@@ -1288,6 +1341,8 @@ def type_typestr(dtype):
 def type_repr(t):
     if is_array(t):
         return str(f"array(ndim={t.ndim}, dtype={t.dtype})")
+    if is_tile(t):
+        return str(f"tile(dtype={t.dtype}, m={t.M}, n={t.N})")
     if type_is_vector(t):
         return str(f"vector(length={t._shape_[0]}, dtype={t._wp_scalar_type_})")
     if type_is_matrix(t):
@@ -1335,7 +1390,7 @@ value_types = (int, float, builtins.bool) + scalar_types
 
 # returns true for all value types (int, float, bool, scalars, vectors, matrices)
 def type_is_value(x):
-    return x in value_types or issubclass(x, ctypes.Array)
+    return x in value_types or hasattr(x, "_wp_scalar_type_")
 
 
 # equivalent of the above but for values
@@ -1439,7 +1494,14 @@ def types_equal(a, b, match_generic=False):
 
         return True
 
-    if is_array(a) and type(a) is type(b):
+    if is_array(a) and type(a) is type(b) and types_equal(a.dtype, b.dtype, match_generic=match_generic):
+        return True
+
+    # match NewStructInstance and Struct dtype
+    if getattr(a, "cls", "a") is getattr(b, "cls", "b"):
+        return True
+
+    if is_tile(a) and is_tile(b):
         return True
 
     return scalars_equal(a, b, match_generic)
@@ -1486,7 +1548,7 @@ def array_ctype_from_interface(interface: dict, dtype=None, owner=None):
         strides = strides_from_shape(shape, element_dtype)
 
     if dtype is None:
-        # accept verbatum
+        # accept verbatim
         pass
     elif hasattr(dtype, "_shape_"):
         # vector/matrix types, ensure element dtype matches
@@ -1576,7 +1638,7 @@ class array(Array):
 
         Args:
             data (Union[list, tuple, ndarray]): An object to construct the array from, can be a Tuple, List, or generally any type convertible to an np.array
-            dtype (Union): One of the built-in types, e.g.: :class:`warp.mat33`, if dtype is Any and data an ndarray then it will be inferred from the array data type
+            dtype (Union): One of the available `data types <#data-types>`_, such as :class:`warp.float32`, :class:`warp.mat33`, or a custom `struct <#structs>`_. If dtype is ``Any`` and data is an ndarray, then it will be inferred from the array data type
             shape (tuple): Dimensions of the array
             strides (tuple): Number of bytes in each dimension between successive elements of the array
             length (int): Number of elements of the data type (deprecated, users should use `shape` argument)
@@ -1601,6 +1663,9 @@ class array(Array):
         self._array_interface = None
         self.is_transposed = False
 
+        # reference to other array
+        self._ref = None
+
         # canonicalize dtype
         if dtype == int:
             dtype = int32
@@ -1614,7 +1679,9 @@ class array(Array):
             if isinstance(shape, int):
                 shape = (shape,)
             else:
-                shape = tuple(shape)
+                # The type of shape's elements are eventually passed onto capacity which is used to allocate memory. We
+                # explicitly enforce that shape is a tuple of (64-bit) ints to ensure that capacity is 64-bit.
+                shape = tuple(int(x) for x in shape)
                 if len(shape) > ARRAY_MAX_DIMS:
                     raise RuntimeError(
                         f"Failed to create array with shape {shape}, the maximum number of dimensions is {ARRAY_MAX_DIMS}"
@@ -1649,9 +1716,6 @@ class array(Array):
                 self._requires_grad = requires_grad
                 if requires_grad:
                     self._alloc_grad()
-
-        # reference to other array
-        self._ref = None
 
     def _init_from_data(self, data, dtype, shape, device, copy, pinned):
         if not hasattr(data, "__len__"):
@@ -2003,24 +2067,27 @@ class array(Array):
         if self.device is None:
             raise RuntimeError("Array has no device assigned")
 
-        if self.device.is_cuda and stream != -1:
-            if not isinstance(stream, int):
-                raise TypeError("DLPack stream must be an integer or None")
+        # check if synchronization is needed
+        if stream != -1:
+            if self.device.is_cuda:
+                # validate stream argument
+                if stream is None:
+                    stream = 1  # legacy default stream
+                elif not isinstance(stream, int) or stream < -1:
+                    raise TypeError("DLPack stream must None or an integer >= -1")
 
-            # assume that the array is being used on its device's current stream
-            array_stream = self.device.stream
+                # assume that the array is being used on its device's current stream
+                array_stream = self.device.stream
 
-            # the external stream should wait for outstanding operations to complete
-            if stream in (None, 0, 1):
-                external_stream = 0
-            else:
-                external_stream = stream
-
-            # Performance note: avoid wrapping the external stream in a temporary Stream object
-            if external_stream != array_stream.cuda_stream:
-                warp.context.runtime.core.cuda_stream_wait_stream(
-                    external_stream, array_stream.cuda_stream, array_stream.cached_event.cuda_event
-                )
+                # Performance note: avoid wrapping the external stream in a temporary Stream object
+                if stream != array_stream.cuda_stream:
+                    warp.context.runtime.core.cuda_stream_wait_stream(
+                        stream, array_stream.cuda_stream, array_stream.cached_event.cuda_event
+                    )
+            elif self.device.is_cpu:
+                # on CPU, stream must be None or -1
+                if stream is not None:
+                    raise TypeError("DLPack stream must be None or -1 for CPU device")
 
         return warp.dlpack.to_dlpack(self)
 
@@ -2203,13 +2270,22 @@ class array(Array):
             self._requires_grad = False
         else:
             # make sure the given gradient array is compatible
-            if (
-                grad.dtype != self.dtype
-                or grad.shape != self.shape
-                or grad.strides != self.strides
-                or grad.device != self.device
-            ):
-                raise ValueError("The given gradient array is incompatible")
+            if grad.dtype != self.dtype:
+                raise ValueError(
+                    f"The given gradient array is incompatible: expected dtype {self.dtype}, got {grad.dtype}"
+                )
+            if grad.shape != self.shape:
+                raise ValueError(
+                    f"The given gradient array is incompatible: expected shape {self.shape}, got {grad.shape}"
+                )
+            if grad.device != self.device:
+                raise ValueError(
+                    f"The given gradient array is incompatible: expected device {self.device}, got {grad.device}"
+                )
+            if grad.strides != self.strides:
+                raise ValueError(
+                    f"The given gradient array is incompatible: expected strides {self.strides}, got {grad.strides}"
+                )
             self._grad = grad
             self._requires_grad = True
 
@@ -2896,6 +2972,119 @@ def array_type_id(a):
         raise ValueError("Invalid array type")
 
 
+# tile expression objects
+class Tile:
+    allocation = 0
+
+    def __init__(self, dtype, M, N, op=None, storage="register", layout="rowmajor", owner=True):
+        self.dtype = type_to_warp(dtype)
+        self.M = M
+        self.N = N
+        self.op = op
+        self.storage = storage
+        self.layout = layout
+
+        # default to row major layout
+        if layout == "rowmajor":
+            self.strides = (N, 1)
+        elif layout == "colmajor":
+            self.strides = (1, M)
+
+        self.owner = owner
+
+    # generates C-type string
+    def ctype(self):
+        from warp.codegen import Var
+
+        if self.storage == "register":
+            return f"wp::tile_register_t<{Var.type_to_ctype(self.dtype)},{self.M},{self.N}>"
+        elif self.storage == "shared":
+            return f"wp::tile_shared_t<{Var.type_to_ctype(self.dtype)},{self.M},{self.N},{self.strides[0]}, {self.strides[1]}>"
+        else:
+            raise RuntimeError(f"Unrecognized tile storage type {self.storage}")
+
+    # generates C-initializer string
+    def cinit(self, adjoint=False):
+        from warp.codegen import Var
+
+        if self.storage == "register":
+            return self.ctype() + "(0.0)"
+        elif self.storage == "shared":
+            # if this is a reference to another tile
+            # then don't allocate any memory
+
+            if adjoint:
+                # backward pass requires zeroed memory
+                return f"wp::tile_alloc_zeros<{Var.type_to_ctype(self.dtype)},{self.M},{self.N},{self.strides[0]}, {self.strides[1]}, {Tile.alloc()}>()"
+            else:
+                if not self.owner:
+                    # will be initialized by subsequent call, e.g.: t = tile_broadcast(a)
+                    return "NULL"
+                else:
+                    # forward mode can be uninitialized until first used by the kernel
+                    return f"wp::tile_alloc_empty<{Var.type_to_ctype(self.dtype)},{self.M},{self.N},{Tile.alloc()}>()"
+
+    # generate a unique allocation index for shared memory
+    @classmethod
+    def alloc(cls):
+        index = Tile.allocation
+        Tile.allocation += 1
+        return index
+
+
+class TileZeros(Tile):
+    def __init__(self, dtype, M, N, storage="register"):
+        Tile.__init__(self, dtype, M, N, op="zeros", storage=storage)
+
+
+class TileRange(Tile):
+    def __init__(self, dtype, start, stop, step, storage="register"):
+        self.start = start
+        self.stop = stop
+        self.step = step
+
+        M = 1
+        N = int((stop - start) / step)
+
+        Tile.__init__(self, dtype, M, N, op="arange", storage=storage)
+
+
+class TileConstant(Tile):
+    def __init__(self, dtype, M, N):
+        Tile.__init__(self, dtype, M, N, op="constant", storage="register")
+
+
+class TileLoad(Tile):
+    def __init__(self, array, M, N, storage="register"):
+        Tile.__init__(self, array.dtype, M, N, op="load", storage=storage)
+
+
+class TileUnaryMap(Tile):
+    def __init__(self, t, storage="register"):
+        Tile.__init__(self, t.dtype, t.M, t.N, op="unary_map", storage=storage)
+
+        self.t = t
+
+
+class TileBinaryMap(Tile):
+    def __init__(self, a, b, storage="register"):
+        Tile.__init__(self, a.dtype, a.M, a.N, op="binary_map", storage=storage)
+
+        self.a = a
+        self.b = b
+
+
+class TileShared(Tile):
+    def __init__(self, t):
+        Tile.__init__(self, t.dtype, t.M, t.N, "shared", storage="shared")
+
+        self.t = t
+
+
+def is_tile(t):
+    return isinstance(t, Tile)
+
+
 class Bvh:
     def __new__(cls, *args, **kwargs):
         instance = super(Bvh, cls).__new__(cls)
@@ -2989,7 +3178,7 @@ class Mesh:
 
         Args:
             points (:class:`warp.array`): Array of vertex positions of type :class:`warp.vec3`
-            indices (:class:`warp.array`): Array of triangle indices of type :class:`warp.int32`, should be a 1d array with shape (num_tris, 3)
+            indices (:class:`warp.array`): Array of triangle indices of type :class:`warp.int32`, should be a 1d array with shape (num_tris * 3)
             velocities (:class:`warp.array`): Array of vertex velocities of type :class:`warp.vec3` (optional)
             support_winding_number (bool): If true the mesh will build additional datastructures to support `wp.mesh_query_point_sign_winding_number()` queries
         """
@@ -3010,8 +3199,8 @@ class Mesh:
             raise RuntimeError("Mesh indices should be a flattened 1d array of indices")
 
         self.device = points.device
-        self.points = points
-        self.velocities = velocities
+        self._points = points
+        self._velocities = velocities
         self.indices = indices
 
         self.runtime = warp.context.runtime
@@ -3054,6 +3243,72 @@ class Mesh:
             self.runtime.core.mesh_refit_host(self.id)
         else:
             self.runtime.core.mesh_refit_device(self.id)
+            self.runtime.verify_cuda_device(self.device)
+
+    @property
+    def points(self):
+        """The array of mesh's vertex positions of type :class:`warp.vec3`.
+
+        The `Mesh.points` property has a custom setter method. Users can modify the vertex positions in-place,
+        but the `refit()` method must be called manually after such modifications. Alternatively, assigning a new array
+        to this property is also supported. The new array must have the same shape as the original, and once assigned,
+        the `Mesh` class will automatically perform a refit operation based on the new vertex positions.
+        """
+        return self._points
+
+    @points.setter
+    def points(self, points_new):
+        if points_new.device != self._points.device:
+            raise RuntimeError(
+                "The new points and the original points must live on the same device, currently "
+                "the new points lives on {} while the old points lives on {}.".format(
+                    points_new.device, self._points.device
+                )
+            )
+
+        if points_new.ndim != 1 or points_new.shape[0] != self._points.shape[0]:
+            raise RuntimeError(
+                "the new points and the original points must have the same shape, currently new points shape is: {},"
+                " while the old points' shape is: {}".format(points_new.shape, self._points.shape)
+            )
+
+        self._points = points_new
+        if self.device.is_cpu:
+            self.runtime.core.mesh_set_points_host(self.id, points_new.__ctype__())
+        else:
+            self.runtime.core.mesh_set_points_device(self.id, points_new.__ctype__())
+            self.runtime.verify_cuda_device(self.device)
+
+    @property
+    def velocities(self):
+        """The array of mesh's velocities of type :class:`warp.vec3`.
+
+        This is a property with a custom setter method. Users can modify the velocities in-place,
+        or assigning a new array to this property. No refitting is needed for changing velocities.
+        """
+        return self._velocities
+
+    @velocities.setter
+    def velocities(self, velocities_new):
+        if velocities_new.device != self._velocities.device:
+            raise RuntimeError(
+                "The new points and the original points must live on the same device, currently "
+                "the new points lives on {} while the old points lives on {}.".format(
+                    velocities_new.device, self._velocities.device
+                )
+            )
+
+        if velocities_new.ndim != 1 or velocities_new.shape[0] != self._velocities.shape[0]:
+            raise RuntimeError(
+                "the new points and the original points must have the same shape, currently new points shape is: {},"
+                " while the old points' shape is: {}".format(velocities_new.shape, self._velocities.shape)
+            )
+
+        self._velocities = velocities_new
+        if self.device.is_cpu:
+            self.runtime.core.mesh_set_velocities_host(self.id, velocities_new.__ctype__())
+        else:
+            self.runtime.core.mesh_set_velocities_device(self.id, velocities_new.__ctype__())
             self.runtime.verify_cuda_device(self.device)
 
 
@@ -3341,7 +3596,7 @@ class Volume:
         )
 
     def feature_array(self, feature_index: int, dtype=None) -> array:
-        """Returns one the the grid's feature data arrays as a Warp array
+        """Returns one the grid's feature data arrays as a Warp array
 
         Args:
             feature_index: Index of the supplemental data array in the grid
@@ -3527,8 +3782,9 @@ class Volume:
         )
         if hasattr(bg_value, "__len__"):
             # vec3, assuming the numpy array is 4D
-            padded_array = np.array((target_shape[0], target_shape[1], target_shape[2], 3), dtype=np.single)
-            padded_array[:, :, :, :] = np.array(bg_value)
+            padded_array = np.full(
+                shape=(target_shape[0], target_shape[1], target_shape[2], 3), fill_value=bg_value, dtype=np.single
+            )
             padded_array[0 : ndarray.shape[0], 0 : ndarray.shape[1], 0 : ndarray.shape[2], :] = ndarray
         else:
             padded_amount = (
@@ -5022,7 +5278,7 @@ def get_type_code(arg_type):
     elif isinstance(arg_type, indexedfabricarray):
         return f"ifa{arg_type.ndim}{get_type_code(arg_type.dtype)}"
     elif isinstance(arg_type, warp.codegen.Struct):
-        return warp.codegen.make_full_qualified_name(arg_type.cls)
+        return arg_type.native_name
     elif arg_type == Scalar:
         # generic scalar type
         return "s?"

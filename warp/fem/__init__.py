@@ -1,3 +1,4 @@
+from .adaptivity import adaptive_nanogrid_from_field, adaptive_nanogrid_from_hierarchy
 from .cache import TemporaryStore, borrow_temporary, borrow_temporary_like, set_default_temporary_store
 from .dirichlet import normalize_dirichlet_projector, project_linear_system
 from .domain import BoundarySides, Cells, FrontierSides, GeometryDomain, Sides, Subdomain
@@ -13,6 +14,7 @@ from .field import (
     make_trial,
 )
 from .geometry import (
+    AdaptiveNanogrid,
     ExplicitGeometryPartition,
     Geometry,
     GeometryPartition,
@@ -22,14 +24,17 @@ from .geometry import (
     LinearGeometryPartition,
     Nanogrid,
     Quadmesh2D,
+    Quadmesh3D,
     Tetmesh,
     Trimesh2D,
+    Trimesh3D,
 )
 from .integrate import integrate, interpolate
 from .operator import (
     D,
     at_node,
     average,
+    cells,
     curl,
     deformation_gradient,
     degree,
@@ -48,6 +53,9 @@ from .operator import (
     normal,
     outer,
     position,
+    to_cell_side,
+    to_inner_cell,
+    to_outer_cell,
 )
 from .polynomial import Polynomial
 from .quadrature import ExplicitQuadrature, NodalQuadrature, PicQuadrature, Quadrature, RegularQuadrature

@@ -320,7 +320,7 @@ CUDA_CALLABLE inline bvh_query_t bvh_query_aabb(
 CUDA_CALLABLE inline bvh_query_t bvh_query_ray(
     uint64_t id, const vec3& start, const vec3& dir)
 {
-	return bvh_query(id, true, start, dir);
+	return bvh_query(id, true, start, 1.0f / dir);
 }
 
 //Stub
@@ -402,6 +402,10 @@ CUDA_CALLABLE inline bvh_query_t iter_reverse(const bvh_query_t& query)
 {
     // can't reverse BVH queries, users should not rely on traversal ordering
     return query;
+}
+
+CUDA_CALLABLE inline void adj_iter_reverse(const bvh_query_t& query, bvh_query_t& adj_query, bvh_query_t& adj_ret)
+{
 }
 
 

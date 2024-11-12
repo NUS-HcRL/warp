@@ -592,7 +592,7 @@ def jcalc_integrate(
         p_s = wp.vec3(joint_q[coord_start + 0], joint_q[coord_start + 1], joint_q[coord_start + 2])
 
         # linear vel of origin (note q/qd switch order of linear angular elements)
-        # note we are converting the body twist in the space frame (w_s, v_s) to compute center of mass velcity
+        # note we are converting the body twist in the space frame (w_s, v_s) to compute center of mass velocity
         dpdt_s = v_s + wp.cross(w_s, p_s)
 
         # quat and quat derivative
@@ -1015,7 +1015,7 @@ def eval_rigid_tau(
 def eval_rigid_jacobian(
     articulation_start: wp.array(dtype=int),
     articulation_J_start: wp.array(dtype=int),
-    joint_parent: wp.array(dtype=int),
+    joint_ancestor: wp.array(dtype=int),
     joint_qd_start: wp.array(dtype=int),
     joint_S_s: wp.array(dtype=wp.spatial_vector),
     # outputs
@@ -1051,7 +1051,7 @@ def eval_rigid_jacobian(
                 for k in range(6):
                     J[J_offset + dense_index(articulation_dof_count, row_start + k, col)] = S[k]
 
-            j = joint_parent[j]
+            j = joint_ancestor[j]
 
 
 @wp.func
@@ -1621,7 +1621,7 @@ class FeatherstoneIntegrator(Integrator):
             eval_particle_ground_contact_forces(model, state_in, particle_f)
 
             # particle shape contact
-            eval_particle_body_contact_forces(model, state_in, particle_f, body_f)
+            eval_particle_body_contact_forces(model, state_in, particle_f, body_f, body_f_in_world_frame=True)
 
             # muscles
             if False:
@@ -1769,7 +1769,7 @@ class FeatherstoneIntegrator(Integrator):
                             inputs=[
                                 model.articulation_start,
                                 self.articulation_J_start,
-                                model.joint_parent,
+                                model.joint_ancestor,
                                 model.joint_qd_start,
                                 state_aug.joint_S_s,
                             ],

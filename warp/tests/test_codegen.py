@@ -13,6 +13,21 @@ from warp.tests.unittest_utils import *
 
 
 @wp.kernel
+def test_expect():
+    a = 1.0
+    a += 2.0
+
+    wp.expect_eq(123, 123)
+    wp.expect_neq(123, 234)
+
+    wp.expect_eq(wp.vec2(1.0, 2.0), wp.vec2(1.0, 2.0))
+    wp.expect_neq(wp.vec2(1.0, 2.0), wp.vec2(2.0, 3.0))
+
+    wp.expect_eq(wp.mat22(1.0, 2.0, 3.0, 4.0), wp.mat22(1.0, 2.0, 3.0, 4.0))
+    wp.expect_neq(wp.mat22(1.0, 2.0, 3.0, 4.0), wp.mat22(2.0, 3.0, 4.0, 5.0))
+
+
+@wp.kernel
 def test_rename():
     a = 0
     b = 1
@@ -405,24 +420,24 @@ def test_error_global_var(test, device):
 
     kernel = wp.Kernel(func=kernel_1_fn)
     with test.assertRaisesRegex(
-        RuntimeError,
-        r"Cannot reference a global variable from a kernel unless `wp.constant\(\)` is being used",
+        TypeError,
+        r"Invalid external reference type: <class 'warp.types.array'>",
     ):
-        wp.launch(kernel, dim=out.shape, inputs=(), outputs=(out,))
+        wp.launch(kernel, dim=out.shape, inputs=(), outputs=(out,), device=device)
 
     kernel = wp.Kernel(func=kernel_2_fn)
     with test.assertRaisesRegex(
-        RuntimeError,
-        r"Cannot reference a global variable from a kernel unless `wp.constant\(\)` is being used",
+        TypeError,
+        r"Invalid external reference type: <class 'warp.types.array'>",
     ):
-        wp.launch(kernel, dim=out.shape, inputs=(), outputs=(out,))
+        wp.launch(kernel, dim=out.shape, inputs=(), outputs=(out,), device=device)
 
     kernel = wp.Kernel(func=kernel_3_fn)
     with test.assertRaisesRegex(
-        RuntimeError,
-        r"Cannot reference a global variable from a kernel unless `wp.constant\(\)` is being used",
+        TypeError,
+        r"Invalid external reference type: <class 'warp.types.array'>",
     ):
-        wp.launch(kernel, dim=out.shape, inputs=(), outputs=(out,))
+        wp.launch(kernel, dim=out.shape, inputs=(), outputs=(out,), device=device)
 
 
 def test_error_collection_construct(test, device):
@@ -443,28 +458,28 @@ def test_error_collection_construct(test, device):
         RuntimeError,
         r"List constructs are not supported in kernels. Use vectors like `wp.vec3\(\)` for small collections instead.",
     ):
-        wp.launch(kernel, dim=1)
+        wp.launch(kernel, dim=1, device=device)
 
     kernel = wp.Kernel(func=kernel_2_fn)
     with test.assertRaisesRegex(
         RuntimeError,
         r"Tuple constructs are not supported in kernels. Use vectors like `wp.vec3\(\)` for small collections instead.",
     ):
-        wp.launch(kernel, dim=1)
+        wp.launch(kernel, dim=1, device=device)
 
     kernel = wp.Kernel(func=kernel_3_fn)
     with test.assertRaisesRegex(
         RuntimeError,
         r"Construct `ast.Dict` not supported in kernels.",
     ):
-        wp.launch(kernel, dim=1)
+        wp.launch(kernel, dim=1, device=device)
 
     kernel = wp.Kernel(func=kernel_4_fn)
     with test.assertRaisesRegex(
         RuntimeError,
         r"Tuple constructs are not supported in kernels. Use vectors like `wp.vec3\(\)` instead.",
     ):
-        wp.launch(kernel, dim=1)
+        wp.launch(kernel, dim=1, device=device)
 
 
 def test_error_unmatched_arguments(test, device):
@@ -479,14 +494,99 @@ def test_error_unmatched_arguments(test, device):
         RuntimeError,
         r"Input types must be the same, got \['int32', 'float32'\]",
     ):
-        wp.launch(kernel, dim=1)
+        wp.launch(kernel, dim=1, device=device)
 
     kernel = wp.Kernel(func=kernel_2_fn)
     with test.assertRaisesRegex(
         RuntimeError,
         r"Input types must be exactly the same, got \[\"vector\(length=2, dtype=<class 'warp.types.float32'>\)\", \"vector\(length=2, dtype=<class 'warp.types.float16'>\)\"\]",
     ):
-        wp.launch(kernel, dim=1)
+        wp.launch(kernel, dim=1, device=device)
+
+
+def test_error_mutating_constant_in_dynamic_loop(test, device):
+    @wp.kernel
+    def dynamic_loop_kernel(n: int, input: wp.array(dtype=float)):
+        my_constant = 0.0
+        for i in range(n):
+            my_constant += input[i]
+
+    inputs = wp.array([1.0, 2.0, 3.0], dtype=float, device=device)
+    with test.assertRaisesRegex(
+        wp.codegen.WarpCodegenError,
+        r"Error mutating a constant my_constant inside a dynamic loop, use the following syntax\: pi = float\(3\.141\) to declare a dynamic variable",
+    ):
+        wp.launch(dynamic_loop_kernel, dim=1, inputs=[3, inputs], device=device)
+
+    # the following nested loop must not raise an error
+    const_a = 7
+    const_b = 5
+
+    @wp.kernel
+    def mixed_dyn_static_loop_kernel(dyn_a: int, dyn_b: int, dyn_c: int, output: wp.array(dtype=float, ndim=2)):
+        tid = wp.tid()
+        for i in range(const_a + 1):
+            for j in range(dyn_a + 1):
+                for k in range(dyn_b + 1):
+                    for l in range(const_b + 1):
+                        for m in range(dyn_c + 1):
+                            coeff = i + j + k + l + m
+                            output[tid, coeff] = 1.0
+
+    dyn_a, dyn_b, dyn_c = 3, 4, 5
+    num_threads = 10
+    output = wp.empty([num_threads, const_a + const_b + dyn_a + dyn_b + dyn_c + 1], dtype=float, device=device)
+    wp.launch(
+        mixed_dyn_static_loop_kernel,
+        num_threads,
+        inputs=[
+            dyn_a,
+            dyn_b,
+            dyn_c,
+        ],
+        outputs=[output],
+        device=device,
+    )
+    assert_np_equal(output.numpy(), np.ones([num_threads, const_a + const_b + dyn_a + dyn_b + dyn_c + 1]))
+
+    @wp.kernel
+    def static_then_dynamic_loop_kernel(mats: wp.array(dtype=wp.mat33d)):
+        tid = wp.tid()
+        mat = wp.mat33d()
+        for i in range(3):
+            for j in range(3):
+                mat[i, j] = wp.float64(0.0)
+
+        dim = 2
+        for i in range(dim + 1):
+            for j in range(dim + 1):
+                mat[i, j] = wp.float64(1.0)
+
+        mats[tid] = mat
+
+    mats = wp.empty(1, dtype=wp.mat33d, device=device)
+    wp.launch(static_then_dynamic_loop_kernel, dim=1, inputs=[mats], device=device)
+    assert_np_equal(mats.numpy(), np.ones((1, 3, 3)))
+
+    @wp.kernel
+    def dynamic_then_static_loop_kernel(mats: wp.array(dtype=wp.mat33d)):
+        tid = wp.tid()
+        mat = wp.mat33d()
+
+        dim = 2
+        for i in range(dim + 1):
+            for j in range(dim + 1):
+                mat[i, j] = wp.float64(1.0)
+
+        for i in range(3):
+            for j in range(3):
+                mat[i, j] = wp.float64(0.0)
+
+        mats[tid] = mat
+
+    mats = wp.empty(1, dtype=wp.mat33d, device=device)
+    wp.launch(dynamic_then_static_loop_kernel, dim=1, inputs=[mats], device=device)
+    assert_np_equal(mats.numpy(), np.zeros((1, 3, 3)))
 
 
 @wp.kernel
@@ -507,12 +607,37 @@ def test_call_syntax():
     wp.expect_eq(wp.matrix(rot=rot, pos=pos, dtype=wp.float32, scale=scale), expected_matrix)
 
 
+# test shadowing builtin functions
+@wp.func
+def sum(a: wp.vec3) -> float:
+    return a[0] + a[1] + a[2]
+
+
+@wp.kernel
+def test_shadow_builtin():
+    wp.expect_eq(sum(wp.vec3(1.0)), 3.0)
+
+
+@wp.struct
+class Iterator:
+    valid: wp.bool
+
+
+@wp.kernel(enable_backward=False)
+def test_while_condition_eval():
+    it = Iterator()
+    it.valid = True
+    while it.valid:
+        it.valid = False
+
+
 class TestCodeGen(unittest.TestCase):
     pass
 
 
 devices = get_test_devices()
 
+add_kernel_test(TestCodeGen, name="test_expect", kernel=test_expect, dim=1, devices=devices)
 add_kernel_test(TestCodeGen, name="test_inplace", kernel=test_inplace, dim=1, devices=devices)
 add_kernel_test(TestCodeGen, name="test_rename", kernel=test_rename, dim=1, devices=devices)
 add_kernel_test(TestCodeGen, name="test_constant", kernel=test_constant, inputs=[1.0], dim=1, devices=devices)
@@ -643,8 +768,16 @@ add_function_test(
 add_function_test(
     TestCodeGen, func=test_error_unmatched_arguments, name="test_error_unmatched_arguments", devices=devices
 )
+add_function_test(
+    TestCodeGen,
+    func=test_error_mutating_constant_in_dynamic_loop,
+    name="test_error_mutating_constant_in_dynamic_loop",
+    devices=devices,
+)
 
 add_kernel_test(TestCodeGen, name="test_call_syntax", kernel=test_call_syntax, dim=1, devices=devices)
+add_kernel_test(TestCodeGen, name="test_shadow_builtin", kernel=test_shadow_builtin, dim=1, devices=devices)
+add_kernel_test(TestCodeGen, name="test_while_condition_eval", kernel=test_while_condition_eval, dim=1, devices=devices)
 
 
 if __name__ == "__main__":

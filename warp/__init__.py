@@ -26,6 +26,9 @@ from warp.types import transform, transformh, transformf, transformd
 from warp.types import spatial_vector, spatial_vectorh, spatial_vectorf, spatial_vectord
 from warp.types import spatial_matrix, spatial_matrixh, spatial_matrixf, spatial_matrixd
 
+# annotation types
+from warp.types import Int, Float, Scalar
+
 # geometry types
 from warp.types import Bvh, Mesh, HashGrid, Volume, MarchingCubes
 from warp.types import BvhQuery, HashGridQuery, MeshQueryAABB, MeshQueryPoint, MeshQueryRay
@@ -58,6 +61,7 @@ from warp.context import (
     copy,
     from_numpy,
     launch,
+    launch_tiled,
     synchronize,
     force_load,
     load_module,
@@ -99,11 +103,17 @@ from warp.jax import device_from_jax, device_to_jax
 
 from warp.dlpack import from_dlpack, to_dlpack
 
+from warp.paddle import from_paddle, to_paddle
+from warp.paddle import dtype_from_paddle, dtype_to_paddle
+from warp.paddle import device_from_paddle, device_to_paddle
+from warp.paddle import stream_from_paddle
+
 from warp.build import clear_kernel_cache
 
 from warp.constants import *
 
 from . import builtins
+from warp.builtins import static
 
 import warp.config as config
 

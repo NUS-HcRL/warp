@@ -38,6 +38,8 @@ The location of the kernel cache is printed when Warp is initialized.
 generated compilation artifacts as Warp does not automatically try to keep the cache below a certain size.
 
 .. autofunction:: launch
+.. autofunction:: launch_tiled
+    
 .. autofunction:: clear_kernel_cache
 
 .. _Runtime Kernel Creation:
@@ -45,67 +47,7 @@ generated compilation artifacts as Warp does not automatically try to keep the c
 Runtime Kernel Creation
 #######################
 
-It is often desirable to specialize kernels for different types, constants, or functions at runtime.
-We can achieve this through the use of runtime kernel specialization using Python closures.
-
-For example, we might require a variety of kernels that execute particular functions for each item in an array.
-We might also want this function call to be valid for a variety of data types. Making use of closure and generics, we can generate
-these kernels using a single kernel definition::
-
-    def make_kernel(func, dtype):
-        def closure_kernel_fn(data: wp.array(dtype=dtype), out: wp.array(dtype=dtype)):
-            tid = wp.tid()
-            out[tid] = func(data[tid])
-
-        return wp.Kernel(closure_kernel_fn)
-
-In practice, we might use our kernel generator, ``make_kernel()`` as follows::
-
-    @wp.func
-    def sqr(x: Any) -> Any:
-        return x * x
-
-    @wp.func
-    def cube(x: Any) -> Any:
-        return sqr(x) * x
-
-    sqr_float = make_kernel(sqr, wp.float32)
-    cube_double = make_kernel(cube, wp.float64)
-
-    arr = [1.0, 2.0, 3.0]
-    N = len(arr)
-
-    data_float = wp.array(arr, dtype=wp.float32, device=device)
-    data_double = wp.array(arr, dtype=wp.float64, device=device)
-
-    out_float = wp.zeros(N, dtype=wp.float32, device=device)
-    out_double = wp.zeros(N, dtype=wp.float64, device=device)
-
-    wp.launch(sqr_float, dim=N, inputs=[data_float], outputs=[out_float], device=device)
-    wp.launch(cube_double, dim=N, inputs=[data_double], outputs=[out_double], device=device)
-
-We can specialize kernel definitions over Warp constants similarly. The following generates kernels that add a specified constant
-to a generic-typed array value::
-
-    def make_add_kernel(key, constant):
-        def closure_kernel_fn(data: wp.array(dtype=Any), out: wp.array(dtype=Any)):
-            tid = wp.tid()
-            out[tid] = data[tid] + constant
-
-        return wp.Kernel(closure_kernel_fn, key=key)
-
-    add_ones_int = make_add_kernel("add_one", wp.constant(1))
-    add_ones_vec3 = make_add_kernel("add_ones_vec3", wp.constant(wp.vec3(1.0, 1.0, 1.0)))
-
-    a = wp.zeros(2, dtype=int)
-    b = wp.zeros(2, dtype=wp.vec3)
-
-    a_out = wp.zeros_like(a)
-    b_out = wp.zeros_like(b)
-
-    wp.launch(add_ones_int, dim=a.size, inputs=[a], outputs=[a_out], device=device)
-    wp.launch(add_ones_vec3, dim=b.size, inputs=[b], outputs=[b_out], device=device)
-
+Warp allows generating kernels on-the-fly with various customizations, including closure support.  Refer to the :ref:`Code Generation<code_generation>` section for the latest features.
 
 .. _Arrays:
 
@@ -229,8 +171,8 @@ Matrix multiplication is fully differentiable, and can be recorded on the tape l
 
     tape = wp.Tape()
     with tape:
-        wp.matmul(A, B, C, D, device=device)
-        wp.launch(loss_kernel, dim=(m, n), inputs=[D, loss], device=device)
+        wp.matmul(A, B, C, D)
+        wp.launch(loss_kernel, dim=(m, n), inputs=[D, loss])
 
     tape.backward(loss=loss)
     A_grad = A.grad.numpy()
@@ -682,12 +624,15 @@ This can be surprising for users that are accustomed to C-style conversions but 
     Users should explicitly cast variables to compatible types using constructors like
     ``int()``, ``float()``, ``wp.float16()``, ``wp.uint8()``, etc.
 
+.. note::
+    For performance reasons, Warp relies on native compilers to perform numeric conversions (e.g., LLVM for CPU and NVRTC for CUDA).  This is generally not a problem, but in some cases the results may vary on different devices.  For example, the conversion ``wp.uint8(-1.0)`` results in undefined behavior, since the floating point value -1.0 is out of range for unsigned integer types.  C++ compilers are free to handle such cases as they see fit.  Numeric conversions are only guaranteed to produce correct results when the value being converted is in the range supported by the target data type.
+
 Constants
 ---------
 
-In general, Warp kernels cannot access variables in the global Python interpreter state. One exception to this is for compile-time constants, which may be declared globally (or as class attributes) and folded into the kernel definition.
+A Warp kernel can access Python variables defined outside of the kernel, which are treated as compile-time constants inside of the kernel.
 
-Constants are defined using the ``wp.constant()`` function. An example is shown below::
+.. code:: python
 
     TYPE_SPHERE = wp.constant(0)
     TYPE_CUBE = wp.constant(1)
@@ -698,15 +643,16 @@ Constants are defined using the ``wp.constant()`` function. An example is shown 
 
         t = geometry[wp.tid()]
 
-        if (t == TYPE_SPHERE):
+        if t == TYPE_SPHERE:
             print("sphere")
-        if (t == TYPE_CUBE):
+        elif t == TYPE_CUBE:
             print("cube")
-        if (t == TYPE_CAPSULE):
+        elif t == TYPE_CAPSULE:
             print("capsule")
 
+Note that using ``wp.constant()`` is no longer required, but it performs some type checking and can serve as a reminder that the variables are meant to be used as Warp constants.
 
-.. autoclass:: constant
+The behavior is simple and intuitive when the referenced Python variables never change. For details and more complex scenarios, refer to :ref:`External References and Constants<external_references>`. The :ref:`Code Generation<code_generation>` section contains additional information and tips for advanced usage.
 
 Predefined Constants
 ####################
@@ -814,6 +760,42 @@ Arithmetic Operators
     to the correct type. Also note that the multiplication expression ``a * b`` is used to represent scalar
     multiplication and matrix multiplication. The ``@`` operator is not currently supported.
 
+Streams
+-------
+
+A CUDA stream is a sequence of operations that execute in order on the GPU.
+Operations from different streams may run concurrently and may be interleaved by the device scheduler.
+See the :ref:`Streams documentation <streams>` for more information on using streams.
+
+.. autoclass:: Stream
+    :members:
+    :exclude-members: cached_event
+
+.. autofunction:: get_stream
+.. autofunction:: set_stream
+.. autofunction:: wait_stream
+.. autofunction:: synchronize_stream
+
+.. autoclass:: ScopedStream
+
+Events
+------
+
+Events can be inserted into streams and used to synchronize a stream
+with a different one. See the :ref:`Events documentation <cuda_events>` for
+information on how to use events for cross-stream synchronization
+or the :ref:`CUDA Events Timing documentation <cuda_events_profiling>` for
+information on how to use events for measuring GPU performance.
+
+.. autoclass:: Event
+    :members:
+    :exclude-members: Flags
+
+.. autofunction:: record_event
+.. autofunction:: wait_event
+.. autofunction:: synchronize_event
+.. autofunction:: get_event_elapsed_time
+
 Graphs
 -----------
 
@@ -837,7 +819,7 @@ To record a series of kernel launches use the :func:`wp.capture_begin() <capture
         # end capture and return a graph object
         graph = wp.capture_end(device="cuda")
 
-We strongly recommend the use of the the try-finally pattern when capturing graphs because the `finally`
+We strongly recommend the use of the try-finally pattern when capturing graphs because the `finally`
 statement will ensure :func:`wp.capture_end <capture_end>` gets called, even if an exception occurs during
 capture, which would otherwise trap the stream in a capturing state.
 
@@ -866,7 +848,6 @@ Typically it is only beneficial to use CUDA graphs when the graph will be reused
 
 .. autoclass:: ScopedCapture
     :members:
-
 
 Meshes
 ------
@@ -915,6 +896,7 @@ After modifying point locations users should call ``Mesh.refit()`` to rebuild th
 
 .. autoclass:: Mesh
     :members:
+    :exclude-members: vars, Var
 
 Hash Grids
 ----------
@@ -1064,8 +1046,8 @@ Bounding Value Hierarchies (BVH)
 --------------------------------
 
 The :class:`wp.Bvh <Bvh>` class can be used to create a BVH for a group of bounding volumes. This object can then be traversed
-to determine which parts are intersected by a ray using :func:`bvh_query_ray` and which parts are fully contained
-within a certain bounding volume using :func:`bvh_query_aabb`.
+to determine which parts are intersected by a ray using :func:`bvh_query_ray` and which parts overlap
+with a certain bounding volume using :func:`bvh_query_aabb`.
 
 The following snippet demonstrates how to create a :class:`wp.Bvh <Bvh>` object from 100 random bounding volumes:
 

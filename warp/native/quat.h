@@ -29,6 +29,14 @@ struct quat_t
         w = static_cast<Type>(other.w);
     }
 
+    inline CUDA_CALLABLE quat_t(const initializer_array<4, Type> &l)
+    {
+        x = l[0];
+        y = l[1];
+        z = l[2];
+        w = l[3];
+    }
+
     // imaginary part
     Type x;
     Type y;
@@ -477,6 +485,41 @@ inline CUDA_CALLABLE void adj_indexref(quat_t<Type>* q, int idx,
                                        quat_t<Type>& adj_q, int adj_idx, const Type& adj_value)
 {
     // nop
+}
+
+template<typename Type>
+inline CUDA_CALLABLE quat_t<Type> assign(quat_t<Type>& q, int idx, Type value)
+{
+#ifndef NDEBUG
+    if (idx < 0 || idx > 3)
+    {
+        printf("quat index %d out of bounds at %s %d\n", idx, __FILE__, __LINE__);
+        assert(0);
+    }
+#endif
+
+    quat_t<Type> ret(q);
+    ret[idx] = value;
+    return ret;
+}
+
+template<typename Type>
+inline CUDA_CALLABLE void adj_assign(quat_t<Type>& q, int idx, Type value, quat_t<Type>& adj_q, int& adj_idx, Type& adj_value, const quat_t<Type>& adj_ret)
+{
+#ifndef NDEBUG
+    if (idx < 0 || idx > 3)
+    {
+        printf("quat index %d out of bounds at %s %d\n", idx, __FILE__, __LINE__);
+        assert(0);
+    }
+#endif
+
+    adj_value += adj_ret[idx];
+    for(unsigned i=0; i < 4; ++i)
+    {
+        if(i != idx)
+            adj_q[i] += adj_ret[i];
+    }
 }
 
 template<typename Type>

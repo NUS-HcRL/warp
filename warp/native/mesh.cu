@@ -101,7 +101,7 @@ __global__ void bvh_refit_with_solid_angle_kernel(int n, const int* __restrict__
             int finished = atomicAdd(&child_count[parent], 1);
 
             // if we have are the last thread (such that the parent node is now complete)
-            // then update its bounds and move onto the the next parent in the hierarchy
+            // then update its bounds and move onto the next parent in the hierarchy
             if (finished == 1)
             {
                 //printf("Compute non-leaf at %d\n", index);
@@ -290,3 +290,54 @@ void mesh_refit_device(uint64_t id)
     }
 }
 
+void mesh_set_points_device(uint64_t id, wp::array_t<wp::vec3> points)
+{
+    wp::Mesh m;
+    if (mesh_get_descriptor(id, m))
+    {
+        if (points.ndim != 1 || points.shape[0] != m.points.shape[0])
+        {
+            fprintf(stderr, "The new points input for mesh_set_points_device does not match the shape of the original points!\n");
+            return;
+        }
+
+        m.points = points;
+
+        wp::Mesh* mesh_device = (wp::Mesh*)id;
+        memcpy_h2d(WP_CURRENT_CONTEXT, mesh_device, &m, sizeof(wp::Mesh));
+
+        // update the cpu copy as well
+        mesh_set_descriptor(id, m);
+
+        mesh_refit_device(id);
+    }
+    else 
+    {
+        fprintf(stderr, "The mesh id provided to mesh_set_points_device is not valid!\n");
+        return;
+    }
+}
+
+void mesh_set_velocities_device(uint64_t id, wp::array_t<wp::vec3> velocities)
+{
+    wp::Mesh m;
+    if (mesh_get_descriptor(id, m))
+    {
+        if (velocities.ndim != 1 || velocities.shape[0] != m.velocities.shape[0])
+        {
+            fprintf(stderr, "The new velocities input for mesh_set_velocities_device does not match the shape of the original velocities\n");
+            return;
+        }
+
+        m.velocities = velocities;
+
+        wp::Mesh* mesh_device = (wp::Mesh*)id;
+        memcpy_h2d(WP_CURRENT_CONTEXT, mesh_device, &m, sizeof(wp::Mesh));
+        mesh_set_descriptor(id, m);
+    }
+    else 
+    {
+        fprintf(stderr, "The mesh id provided to mesh_set_velocities_device is not valid!\n");
+        return;
+    }
+}

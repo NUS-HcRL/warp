@@ -527,8 +527,9 @@ class Model:
         tri_poses (array): Triangle element rest pose, shape [tri_count, 2, 2], float
         tri_activations (array): Triangle element activations, shape [tri_count], float
         tri_materials (array): Triangle element materials, shape [tri_count, 5], float
+        tri_areas (array): Triangle element rest areas, shape [tri_count], float
 
-        edge_indices (array): Bending edge indices, shape [edge_count*4], int
+        edge_indices (array): Bending edge indices, shape [edge_count*4], int, each row is [o0, o1, v1, v2], where v1, v2 are on the edge
         edge_rest_angle (array): Bending edge rest angle, shape [edge_count], float
         edge_bending_properties (array): Bending edge stiffness and damping parameters, shape [edge_count, 2], float
 
@@ -558,6 +559,7 @@ class Model:
         joint_type (array): Joint type, shape [joint_count], int
         joint_parent (array): Joint parent body indices, shape [joint_count], int
         joint_child (array): Joint child body indices, shape [joint_count], int
+        joint_ancestor (array): Maps from joint index to the index of the joint that has the current joint parent body as child (-1 if no such joint ancestor exists), shape [joint_count], int
         joint_X_p (array): Joint transform in parent frame, shape [joint_count, 7], float
         joint_X_c (array): Joint mass frame in child frame, shape [joint_count, 7], float
         joint_axis (array): Joint axis in child frame, shape [joint_axis_count, 3], float
@@ -639,6 +641,8 @@ class Model:
         joint_dof_count (int): Total number of velocity degrees of freedom of all joints in the system
         joint_coord_count (int): Total number of position degrees of freedom of all joints in the system
 
+        particle_coloring (list of array): The coloring of all the particles, used for VBD's Gauss-Seidel iteration.
+
         device (wp.Device): Device on which the Model was allocated
 
     Note:
@@ -695,6 +699,7 @@ class Model:
         self.tri_poses = None
         self.tri_activations = None
         self.tri_materials = None
+        self.tri_areas = None
 
         self.edge_indices = None
         self.edge_rest_angle = None
@@ -727,6 +732,7 @@ class Model:
         self.joint_type = None
         self.joint_parent = None
         self.joint_child = None
+        self.joint_ancestor = None
         self.joint_X_p = None
         self.joint_X_c = None
         self.joint_axis = None
@@ -805,6 +811,8 @@ class Model:
         self.articulation_count = 0
         self.joint_dof_count = 0
         self.joint_coord_count = 0
+
+        self.particle_coloring = []
 
         self.device = wp.get_device(device)
 
@@ -1174,6 +1182,7 @@ class ModelBuilder:
         self.tri_poses = []
         self.tri_activations = []
         self.tri_materials = []
+        self.tri_areas = []
 
         # edges (bending)
         self.edge_indices = []
@@ -1395,9 +1404,8 @@ class ModelBuilder:
             self.joint_X_p.extend(joint_X_p)
             self.joint_q.extend(joint_q)
 
-            self.add_articulation()
-
             # offset the indices
+            self.articulation_start.extend([a + self.joint_count for a in builder.articulation_start])
             self.joint_parent.extend([p + self.joint_count if p != -1 else -1 for p in builder.joint_parent])
             self.joint_child.extend([c + self.joint_count for c in builder.joint_child])
 
@@ -1493,6 +1501,7 @@ class ModelBuilder:
             "tri_poses",
             "tri_activations",
             "tri_materials",
+            "tri_areas",
             "tet_poses",
             "tet_activations",
             "tet_materials",
@@ -2516,16 +2525,16 @@ class ModelBuilder:
                         )
                     if last_dynamic_body > -1:
                         self.shape_body[shape] = body_data[last_dynamic_body]["id"]
+                        source_m = body_data[last_dynamic_body]["mass"]
+                        source_com = body_data[last_dynamic_body]["com"]
                         # add inertia to last_dynamic_body
                         m = body_data[child_body]["mass"]
-                        com = body_data[child_body]["com"]
+                        com = wp.transform_point(incoming_xform, body_data[child_body]["com"])
                         inertia = body_data[child_body]["inertia"]
                         body_data[last_dynamic_body]["inertia"] += wp.sim.transform_inertia(
                             m, inertia, incoming_xform.p, incoming_xform.q
                         )
                         body_data[last_dynamic_body]["mass"] += m
-                        source_m = body_data[last_dynamic_body]["mass"]
-                        source_com = body_data[last_dynamic_body]["com"]
                         body_data[last_dynamic_body]["com"] = (m * com + source_m * source_com) / (m + source_m)
                         body_data[last_dynamic_body]["shapes"].append(shape)
                         # indicate to recompute inverse mass, inertia for this body
@@ -2593,6 +2602,19 @@ class ModelBuilder:
 
         # sort joints so they appear in the same order as before
         retained_joints.sort(key=lambda x: x["original_id"])
+
+        joint_remap = {}
+        for i, joint in enumerate(retained_joints):
+            joint_remap[joint["original_id"]] = i
+        # update articulation_start
+        for i, old_i in enumerate(self.articulation_start):
+            while old_i not in joint_remap:
+                old_i += 1
+                if old_i >= self.joint_count:
+                    break
+            self.articulation_start[i] = joint_remap.get(old_i, old_i)
+        # remove empty articulation starts, i.e. where the start and end are the same
+        self.articulation_start = list(set(self.articulation_start))
 
         self.joint_name.clear()
         self.joint_type.clear()
@@ -3516,6 +3538,7 @@ class ModelBuilder:
             self.tri_poses.append(inv_D.tolist())
             self.tri_activations.append(0.0)
             self.tri_materials.append((tri_ke, tri_ka, tri_kd, tri_drag, tri_lift))
+            self.tri_areas.append(area)
             return area
 
     def add_triangles(
@@ -3604,7 +3627,9 @@ class ModelBuilder:
                 np.array(tri_lift)[valid_inds],
             )
         )
-        return areas.tolist()
+        areas = areas.tolist()
+        self.tri_areas.extend(areas)
+        return areas
 
     def add_tetrahedron(
         self, i: int, j: int, k: int, l: int, k_mu: float = 1.0e3, k_lambda: float = 1.0e3, k_damp: float = 0.0
@@ -3672,10 +3697,10 @@ class ModelBuilder:
         by the `model.tri_kb` parameter.
 
         Args:
-            i: The index of the first particle
-            j: The index of the second particle
-            k: The index of the third particle
-            l: The index of the fourth particle
+            i: The index of the first particle, i.e., opposite vertex 0
+            j: The index of the second particle, i.e., opposite vertex 1
+            k: The index of the third particle, i.e., vertex 0
+            l: The index of the fourth particle, i.e., vertex 1
             rest: The rest angle across the edge in radians, if not specified it will be computed
 
         Note:
@@ -3723,10 +3748,10 @@ class ModelBuilder:
         by the `model.tri_kb` parameter.
 
         Args:
-            i: The indices of the first particle
-            j: The indices of the second particle
-            k: The indices of the third particle
-            l: The indices of the fourth particle
+            i: The index of the first particle, i.e., opposite vertex 0
+            j: The index of the second particle, i.e., opposite vertex 1
+            k: The index of the third particle, i.e., vertex 0
+            l: The index of the fourth particle, i.e., vertex 1
             rest: The rest angles across the edges in radians, if not specified they will be computed
 
         Note:
@@ -3836,16 +3861,22 @@ class ModelBuilder:
                 p = wp.quat_rotate(rot, g) + pos
                 m = mass
 
+                particle_flag = PARTICLE_FLAG_ACTIVE
+
                 if x == 0 and fix_left:
                     m = 0.0
+                    particle_flag = wp.uint32(int(particle_flag) & ~int(PARTICLE_FLAG_ACTIVE))
                 elif x == dim_x and fix_right:
                     m = 0.0
+                    particle_flag = wp.uint32(int(particle_flag) & ~int(PARTICLE_FLAG_ACTIVE))
                 elif y == 0 and fix_bottom:
                     m = 0.0
+                    particle_flag = wp.uint32(int(particle_flag) & ~int(PARTICLE_FLAG_ACTIVE))
                 elif y == dim_y and fix_top:
                     m = 0.0
+                    particle_flag = wp.uint32(int(particle_flag) & ~int(PARTICLE_FLAG_ACTIVE))
 
-                self.add_particle(p, vel, m)
+                self.add_particle(p, vel, m, flags=particle_flag)
 
                 if x > 0 and y > 0:
                     if reverse_winding:
@@ -3889,22 +3920,20 @@ class ModelBuilder:
         spring_indices = set()
 
         for _k, e in adj.edges.items():
-            # skip open edges
-            if e.f0 == -1 or e.f1 == -1:
-                continue
-
             self.add_edge(
                 e.o0, e.o1, e.v0, e.v1, edge_ke=edge_ke, edge_kd=edge_kd
             )  # opposite 0, opposite 1, vertex 0, vertex 1
 
-            spring_indices.add((min(e.o0, e.o1), max(e.o0, e.o1)))
-            spring_indices.add((min(e.o0, e.v0), max(e.o0, e.v0)))
-            spring_indices.add((min(e.o0, e.v1), max(e.o0, e.v1)))
+            # skip constraints open edges
+            if e.f0 != -1 and e.f1 != -1:
+                spring_indices.add((min(e.o0, e.o1), max(e.o0, e.o1)))
+                spring_indices.add((min(e.o0, e.v0), max(e.o0, e.v0)))
+                spring_indices.add((min(e.o0, e.v1), max(e.o0, e.v1)))
 
-            spring_indices.add((min(e.o1, e.v0), max(e.o1, e.v0)))
-            spring_indices.add((min(e.o1, e.v1), max(e.o1, e.v1)))
+                spring_indices.add((min(e.o1, e.v0), max(e.o1, e.v0)))
+                spring_indices.add((min(e.o1, e.v1), max(e.o1, e.v1)))
 
-            spring_indices.add((min(e.v0, e.v1), max(e.v0, e.v1)))
+                spring_indices.add((min(e.v0, e.v1), max(e.v0, e.v1)))
 
         if add_springs:
             for i, j in spring_indices:
@@ -3988,14 +4017,14 @@ class ModelBuilder:
         adj = wp.utils.MeshAdjacency(self.tri_indices[start_tri:end_tri], end_tri - start_tri)
 
         edgeinds = np.fromiter(
-            (x for e in adj.edges.values() if e.f0 != -1 and e.f1 != -1 for x in (e.o0, e.o1, e.v0, e.v1)),
+            (x for e in adj.edges.values() for x in (e.o0, e.o1, e.v0, e.v1)),
             int,
         ).reshape(-1, 4)
         self.add_edges(
             edgeinds[:, 0],
             edgeinds[:, 1],
             edgeinds[:, 2],
-            edgeinds[:, 0],
+            edgeinds[:, 3],
             edge_ke=[edge_ke] * len(edgeinds),
             edge_kd=[edge_kd] * len(edgeinds),
         )
@@ -4031,7 +4060,7 @@ class ModelBuilder:
         radius_mean: float = default_particle_radius,
         radius_std: float = 0.0,
     ):
-        rng = np.random.default_rng()
+        rng = np.random.default_rng(42)
         for z in range(dim_z):
             for y in range(dim_y):
                 for x in range(dim_x):
@@ -4041,7 +4070,7 @@ class ModelBuilder:
                     p = wp.quat_rotate(rot, v) + pos + wp.vec3(rng.random(3) * jitter)
 
                     if radius_std > 0.0:
-                        r = radius_mean + np.random.randn() * radius_std
+                        r = radius_mean + rng.standard_normal() * radius_std
                     else:
                         r = radius_mean
                     self.add_particle(p, vel, m, r)
@@ -4446,6 +4475,7 @@ class ModelBuilder:
             m.tri_poses = wp.array(self.tri_poses, dtype=wp.mat22, requires_grad=requires_grad)
             m.tri_activations = wp.array(self.tri_activations, dtype=wp.float32, requires_grad=requires_grad)
             m.tri_materials = wp.array(self.tri_materials, dtype=wp.float32, requires_grad=requires_grad)
+            m.tri_areas = wp.array(self.tri_areas, dtype=wp.float32, requires_grad=requires_grad)
 
             # ---------------------
             # edges
@@ -4501,6 +4531,14 @@ class ModelBuilder:
             m.joint_q = wp.array(self.joint_q, dtype=wp.float32, requires_grad=requires_grad)
             m.joint_qd = wp.array(self.joint_qd, dtype=wp.float32, requires_grad=requires_grad)
             m.joint_name = self.joint_name
+            # compute joint ancestors
+            child_to_joint = {}
+            for i, child in enumerate(self.joint_child):
+                child_to_joint[child] = i
+            parent_joint = []
+            for parent in self.joint_parent:
+                parent_joint.append(child_to_joint.get(parent, -1))
+            m.joint_ancestor = wp.array(parent_joint, dtype=wp.int32)
 
             # dynamics properties
             m.joint_armature = wp.array(self.joint_armature, dtype=wp.float32, requires_grad=requires_grad)

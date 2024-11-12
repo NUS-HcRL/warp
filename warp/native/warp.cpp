@@ -147,6 +147,11 @@ int is_cutlass_enabled()
     return int(WP_ENABLE_CUTLASS);
 }
 
+int is_mathdx_enabled()
+{
+    return int(WP_ENABLE_MATHDX);
+}
+
 int is_debug_enabled()
 {
     return int(WP_ENABLE_DEBUG);
@@ -1010,7 +1015,7 @@ WP_API int cuda_set_peer_access_enabled(void* target_context, void* peer_context
 WP_API int cuda_is_mempool_access_enabled(int target_ordinal, int peer_ordinal) { return 0; }
 WP_API int cuda_set_mempool_access_enabled(int target_ordinal, int peer_ordinal, int enable) { return 0; }
 
-WP_API void* cuda_stream_create(void* context) { return NULL; }
+WP_API void* cuda_stream_create(void* context, int priority) { return NULL; }
 WP_API void cuda_stream_destroy(void* context, void* stream) {}
 WP_API void cuda_stream_register(void* context, void* stream) {}
 WP_API void cuda_stream_unregister(void* context, void* stream) {}
@@ -1019,6 +1024,8 @@ WP_API void cuda_stream_synchronize(void* stream) {}
 WP_API void cuda_stream_wait_event(void* stream, void* event) {}
 WP_API void cuda_stream_wait_stream(void* stream, void* other_stream, void* event) {}
 WP_API int cuda_stream_is_capturing(void* stream) { return 0; }
+WP_API uint64_t cuda_stream_get_capture_id(void* stream) { return 0; }
+WP_API int cuda_stream_get_priority(void* stream) { return 0; }
 
 WP_API void* cuda_event_create(void* context, unsigned flags) { return NULL; }
 WP_API void cuda_event_destroy(void* event) {}
@@ -1031,12 +1038,12 @@ WP_API bool cuda_graph_end_capture(void* context, void* stream, void** graph_ret
 WP_API bool cuda_graph_launch(void* graph, void* stream) { return false; }
 WP_API bool cuda_graph_destroy(void* context, void* graph) { return false; }
 
-WP_API size_t cuda_compile_program(const char* cuda_src, int arch, const char* include_dir, bool debug, bool verbose, bool verify_fp, bool fast_math, const char* output_file) { return 0; }
+WP_API size_t cuda_compile_program(const char* cuda_src, int arch, const char* include_dir, int num_cuda_include_dirs, const char** cuda_include_dirs, bool debug, bool verbose, bool verify_fp, bool fast_math, const char* output_path, size_t num_ltoirs, char** ltoirs, size_t* ltoir_sizes) { return 0; }
 
 WP_API void* cuda_load_module(void* context, const char* ptx) { return NULL; }
 WP_API void cuda_unload_module(void* context, void* module) {}
 WP_API void* cuda_get_kernel(void* context, void* module, const char* name) { return NULL; }
-WP_API size_t cuda_launch_kernel(void* context, void* kernel, size_t dim, int max_blocks, void** args, void* stream) { return 0; }
+WP_API size_t cuda_launch_kernel(void* context, void* kernel, size_t dim, int max_blocks, int tile_size, void** args, void* stream) { return 0; }
 
 WP_API void cuda_set_context_restore_policy(bool always_restore) {}
 WP_API int cuda_get_context_restore_policy() { return false; }

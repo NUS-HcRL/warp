@@ -9,7 +9,11 @@
 # CI/CD Pipeline Configuration
 # ==============================================================================
 
-include: /.gitlab/ci/common.yml
+include:
+  - local: /.gitlab/ci/common.yml
+  - project: "omniverse/devplat/gitlab/templates/common/compliance"
+    file: "modules/omniverse-repo-compliance.gitlab-ci.yml"
+    ref: v1_latest
 
 workflow:
   rules:
@@ -30,6 +34,7 @@ variables:
   PIP_CACHE_DIR: '$CI_PROJECT_DIR/.cache/pip'
   CUDA_BIN: '$CI_PROJECT_DIR/_build/target-deps/cuda/bin'
   CUDA: '$CI_PROJECT_DIR/_build/target-deps/cuda'
+  CUDA_HOME: '$CI_PROJECT_DIR/_build/target-deps/cuda'
   PYTHON: '$CI_PROJECT_DIR/_build/target-deps/python/python'
   LINBUILD: '$CI_PROJECT_DIR/_build/host-deps/linbuild/linbuild.sh'
   WARP_CACHE_ROOT: '$CI_PROJECT_DIR/.cache/warp' # Used by the parallel test runner
@@ -57,15 +62,23 @@ stages:
 
 linux-aarch64 build:
   stage: build
-  image: ubuntu:22.04
+  image: ubuntu:20.04
   extends:
     - .save_warp_bin_artifact
   before_script:
     - echo -e "\\e[0Ksection_start:`date +%s`:install_dependencies[collapsed=true]\\r\\e[0KInstalling dependencies"
     - apt-get update && apt-get install build-essential curl --no-install-recommends -y
+    - >
+      curl -k -H "Authorization: Bearer $ARTIFACTORY_ACCESS_TOKEN"
+      $ARTIFACTORY_BASE_URL/sw-cuda-math-mathdx-generic-local/cicd/libmathdx/sandbox/PostMerge/15/libmathdx_build_aarch64_rockylinux8_cuda12.0.0_release.tar.gz
+      -o libmathdx.tar.gz
+    - mkdir -p _build/target-deps
+    - tar -xzf libmathdx.tar.gz -C _build/target-deps
+    - export LIBMATHDX_HOME="$CI_PROJECT_DIR/_build/target-deps/libmathdx-0.1.0-Linux"
+    - gcc --version
     - echo -e "\\e[0Ksection_end:`date +%s`:install_dependencies\\r\\e[0K"
   script:
-    - ./tools/ci/building/build-linux-x86_64/build.sh --no-docker # We are already using the builder image
+    - ./tools/ci/building/build-linux-aarch64/build.sh --no-docker
     - mkdir -p warp/bin/linux-aarch64
     - mv warp/bin/warp.so warp/bin/linux-aarch64
     - mv warp/bin/warp-clang.so warp/bin/linux-aarch64
@@ -74,12 +87,24 @@ linux-aarch64 build:
 
 linux-x86_64 build:
   stage: build
-  image: urm.nvidia.com/ct-omniverse-docker/centos7-gcc10-builder:3.2.0
+  image: ubuntu:20.04
   extends:
     - .save_warp_bin_artifact
     - .runner-build-linux-x86_64
+  before_script:
+    - echo -e "\\e[0Ksection_start:`date +%s`:install_dependencies[collapsed=true]\\r\\e[0KInstalling dependencies"
+    - apt-get update && apt-get install build-essential curl --no-install-recommends -y
+    - >
+      curl -k -H "Authorization: Bearer $ARTIFACTORY_ACCESS_TOKEN"
+      $ARTIFACTORY_BASE_URL/sw-cuda-math-mathdx-generic-local/cicd/libmathdx/sandbox/PostMerge/15/libmathdx_build_x86_64_rockylinux8_cuda12.0.0_release.tar.gz
+      -o libmathdx.tar.gz
+    - mkdir -p _build/target-deps
+    - tar -xzf libmathdx.tar.gz -C _build/target-deps
+    - export LIBMATHDX_HOME="$CI_PROJECT_DIR/_build/target-deps/libmathdx-0.1.0-Linux"
+    - gcc --version
+    - echo -e "\\e[0Ksection_end:`date +%s`:install_dependencies\\r\\e[0K"
   script:
-    - ./tools/ci/building/build-linux-x86_64/build.sh --no-docker # We are already using the builder image
+    - ./tools/ci/building/build-linux-x86_64/build.sh --no-docker
     - mkdir -p warp/bin/linux-x86_64
     - mv warp/bin/warp.so warp/bin/linux-x86_64
     - mv warp/bin/warp-clang.so warp/bin/linux-x86_64
@@ -118,7 +143,7 @@ ruff lint:
     - .runner-utility-linux-x86_64
   before_script:
     - python -m pip install --upgrade pip
-    - pip install --upgrade ruff==0.5.5
+    - pip install --upgrade ruff==0.6.8
   script:
     - ruff check --output-format full  --exit-zero # Just to get something in the log
     - ruff check --output-format gitlab > gl-code-quality-report.json
@@ -134,9 +159,15 @@ ruff format:
     - .runner-utility-linux-x86_64
   before_script:
     - python -m pip install --upgrade pip
-    - pip install --upgrade ruff==0.5.5
+    - pip install --upgrade ruff==0.6.8
   script:
     - ruff format --diff
+
+osec:sonarqube:
+  variables:
+    # Disable C/C++ analyzer until project specific work is done to enable it.
+    # See: https://confluence.nvidia.com/display/OMNIVERSE/SonarQube+Gitlab+CI+Integration#C+Project+Enablement+Additions
+    SONAR_EXTRA_ARGS: "-Dsonar.c.file.suffixes=- -Dsonar.cpp.file.suffixes=- -Dsonar.objc.file.suffixes=-"
 
 # ==============================================================================
 # Main Unit Testing Jobs
@@ -187,9 +218,31 @@ linux-aarch64 test:
     - python -m pip install coverage[toml]
     - echo -e "\\e[0Ksection_end:`date +%s`:install_dependencies\\r\\e[0K"
   script:
-    - python -m warp.tests --junit-report-xml rspec.xml --coverage --coverage-xml coverage.xml -s autodetect
+    - python -m warp.tests --junit-report-xml rspec.xml --coverage --coverage-xml coverage.xml -s autodetect --failfast
   tags:
     - arch/arm
+
+linux-aarch64 test jetson:
+  image: ubuntu:22.04
+  needs: [linux-aarch64 build]
+  extends:
+    - .test_common_main
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule" || $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH 
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH =~ /^release-.*/
+    - when: manual # If not auto-triggered, allow any pipeline to run this job manually
+  allow_failure: true # Unsure of stability of Jetson runner for now
+  before_script:
+    - echo -e "\\e[0Ksection_start:`date +%s`:install_dependencies[collapsed=true]\\r\\e[0KInstalling dependencies"
+    - !reference [.snippets, install-python+warp-aarch64]
+    - python -m pip install coverage[toml]
+    - python -m pip install -U "jax[cuda12]"
+    - echo -e "\\e[0Ksection_end:`date +%s`:install_dependencies\\r\\e[0K"
+  script:
+    - python -m warp.tests --junit-report-xml rspec.xml --coverage --coverage-xml coverage.xml -s autodetect --failfast
+  tags:
+    - gpu/orin
 
 linux-x86_64 test:
   needs: [linux-x86_64 build]
@@ -209,11 +262,13 @@ linux-x86_64 test:
     - python -m pip install --upgrade pip
     - python -m pip install --upgrade usd-core coverage[toml]
     - python -m pip install --upgrade torch --extra-index-url https://download.pytorch.org/whl/cu121
-    - python -m pip install --upgrade "jax[cuda12_pip]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+    - python -m pip install -U "jax[cuda12]"
     - python -m pip install -e .
     - echo -e "\\e[0Ksection_end:`date +%s`:install_dependencies\\r\\e[0K"
+    # HACK: disable P2P tests due to misbehaving agents
+    - export WARP_DISABLE_P2P_TESTS=1
   script:
-    - python -m warp.tests --junit-report-xml rspec.xml --coverage --coverage-xml coverage.xml -s autodetect
+    - python -m warp.tests --junit-report-xml rspec.xml --coverage --coverage-xml coverage.xml -s autodetect --failfast
 
 # Note that for throughput reasons this runs on a single-GPU runner
 windows-x86_64 test:
@@ -231,15 +286,12 @@ windows-x86_64 test:
     - '& $env:CI_PROJECT_DIR\_build\target-deps\python\python.exe -m venv _venv'
     - .\_venv\Scripts\Activate.ps1
     - python -m pip install --upgrade pip
-    - python -m pip install --upgrade usd-core coverage[toml]
-    # Temporary HACK: use NumPy < 2.0 on Windows due to issues with Torch wheels that are not compatible
-    # https://github.com/pytorch/pytorch/issues/128860
-    - python -m pip install "numpy<2"
+    - python -m pip install --upgrade usd-core coverage[toml] numpy
     - python -m pip install --upgrade torch --extra-index-url https://download.pytorch.org/whl/cu121
     - python -m pip install -e .
     - Write-Output "$([char]27)[0Ksection_end:$(GetTime):install_dependencies$([char]13)$([char]27)[0K"
   script:
-    - python -m warp.tests --junit-report-xml rspec.xml --coverage --coverage-xml coverage.xml -s autodetect
+    - python -m warp.tests --junit-report-xml rspec.xml --coverage --coverage-xml coverage.xml -s autodetect --failfast
 
 mac-x86_64 test:
   stage: test
@@ -254,7 +306,7 @@ mac-x86_64 test:
     - python -m pip install --upgrade usd-core coverage[toml]
     - echo -e "\\e[0Ksection_end:`date +%s`:install_dependencies\\r\\e[0K"
   script:
-    - python -m warp.tests --junit-report-xml rspec.xml --coverage --coverage-xml coverage.xml -s autodetect
+    - python -m warp.tests --junit-report-xml rspec.xml --coverage --coverage-xml coverage.xml -s autodetect --failfast
 
 # Test the Linux release build in an environment with minimal Python dependencies installed
 linux-x86_64 test minimal:
@@ -291,8 +343,10 @@ linux-x86_64 test minimal:
     - python -m pip install --upgrade pip
     - python -m pip install -e .
     - echo -e "\\e[0Ksection_end:`date +%s`:install_dependencies\\r\\e[0K"
+    # HACK: disable P2P tests due to misbehaving agents
+    - export WARP_DISABLE_P2P_TESTS=1
   script:
-    - python -m warp.tests --junit-report-xml rspec.xml -s autodetect
+    - python -m warp.tests --junit-report-xml rspec.xml -s autodetect --failfast
 
 # Optional multi-GPU Windows job (likely longer queue time)
 windows-x86_64 test mgpu:
@@ -301,9 +355,8 @@ windows-x86_64 test mgpu:
   extends:
     - .save_test_report_artifact
   rules:
-    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_PIPELINE_SOURCE == "schedule" || $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH 
     - if: $CI_COMMIT_TAG
-    - if: $CI_COMMIT_BRANCH =~ /^release-.*/
     - when: manual # Can be triggered in all other scenarios
       allow_failure: true
   before_script:
@@ -315,15 +368,12 @@ windows-x86_64 test mgpu:
     - '& $env:CI_PROJECT_DIR\_build\target-deps\python\python.exe -m venv _venv'
     - .\_venv\Scripts\Activate.ps1
     - python -m pip install --upgrade pip
-    - python -m pip install --upgrade usd-core
-    # Temporary HACK: use NumPy < 2.0 on Windows due to issues with Torch wheels that are not compatible
-    # https://github.com/pytorch/pytorch/issues/128860
-    - python -m pip install "numpy<2"
+    - python -m pip install --upgrade usd-core numpy
     - python -m pip install --upgrade torch --extra-index-url https://download.pytorch.org/whl/cu121
     - python -m pip install -e .
     - Write-Output "$([char]27)[0Ksection_end:$(GetTime):install_dependencies$([char]13)$([char]27)[0K"
   script:
-    - python -m warp.tests --junit-report-xml rspec.xml -s autodetect
+    - python -m warp.tests --junit-report-xml rspec.xml -s autodetect --failfast
   tags:
     - os/windows
     - gpu/2x-A5000
@@ -351,6 +401,7 @@ linux-x86_64 test warp-init:
         - build_llvm.py
     - when: manual # If not auto-triggered, allow any pipeline to run this job manually
       allow_failure: true
+  timeout: 10m
   before_script:
     - echo -e "\\e[0Ksection_start:`date +%s`:install_dependencies[collapsed=true]\\r\\e[0KInstalling dependencies"
     - df -h
@@ -371,7 +422,7 @@ linux-x86_64 test warp-init:
 # artifacts.
 windows-x86_64 docs:
   stage: test
-  needs: []
+  needs: [windows-x86_64 build]
   extends:
     - .runner-utility-windows-x86_64
   artifacts:
@@ -381,7 +432,7 @@ windows-x86_64 docs:
     - !reference [.snippets, define-powershell-GetTime]
     - Write-Output "$([char]27)[0Ksection_start:$(GetTime):install_dependencies[collapsed=true]$([char]13)$([char]27)[0KInstalling dependencies"
     - powershell -command "Get-Volume | Format-Table -AutoSize"
-    - $python_name = $DEFAULT_PYTHON + "-windows-x86_64"
+    - $python_name = "3.12.6+nv1-windows-x86_64"
     - tools/packman/packman.cmd install -l _build/target-deps/python python $python_name
     - '& $env:CI_PROJECT_DIR\_build\target-deps\python\python.exe -m venv _venv'
     - .\_venv\Scripts\Activate.ps1
@@ -572,7 +623,7 @@ publish wheels to testpypi registry:
   extends:
     - .runner-utility-linux-x86_64
   rules:
-    - if: $PARENT_COMMIT_BRANCH =~ /release-.*/
+    - if: $CI_COMMIT_BRANCH =~ /release-.*/
       when: manual
       allow_failure: true
   environment:
@@ -591,7 +642,7 @@ publish wheels to pypi registry:
   extends:
     - .runner-utility-linux-x86_64
   rules:
-    - if: $PARENT_COMMIT_BRANCH =~ /release-.*/
+    - if: $CI_COMMIT_BRANCH =~ /release-.*/
       when: manual
       allow_failure: true
   environment:
@@ -644,7 +695,7 @@ publish wheels to gitlab package registry:
 .build-docs-common:
   stage: deploy
   image: python:3.11-slim
-  needs: []
+  needs: [linux-x86_64 build]
   extends:
     - .runner-utility-linux-x86_64
   artifacts:
@@ -652,7 +703,11 @@ publish wheels to gitlab package registry:
       - public
   before_script:
     - echo -e "\\e[0Ksection_start:`date +%s`:install_dependencies[collapsed=true]\\r\\e[0KSet up docs environment"
+    - df -h
     - apt-get update && apt-get install make --no-install-recommends -y
+    # Move compiled binaries out of platform-specific directory
+    - mv warp/bin/linux-x86_64/warp.so warp/bin/
+    - mv warp/bin/linux-x86_64/warp-clang.so warp/bin/
     - python -m pip install --upgrade pip
     - python -m pip install -r docs/requirements.txt
     - echo -e "\\e[0Ksection_end:`date +%s`:install_dependencies\\r\\e[0K"
@@ -672,6 +727,7 @@ merge request docs:
       - public
   rules:
     - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+  timeout: 10m
   environment:
     name: review/$CI_MERGE_REQUEST_IID
     url: https://$CI_PROJECT_ROOT_NAMESPACE.$CI_PAGES_DOMAIN/-/$CI_PROJECT_NAME/-/jobs/$CI_JOB_ID/artifacts/public/index.html
@@ -696,6 +752,7 @@ check generated files:
       - docs/modules/functions.rst
   rules:
     - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+  timeout: 10m
   extends:
     - .runner-utility-linux-x86_64
   script:
@@ -713,6 +770,7 @@ pages:
     - .build-docs-common
   rules:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  timeout: 10m
   environment:
     name: GitLab Pages
     deployment_tier: staging

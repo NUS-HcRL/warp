@@ -35,7 +35,7 @@ stages:
 # Hide this job for now until debug aarch64 builds work
 .linux-aarch64 build:
   stage: build
-  image: ubuntu:22.04
+  image: ubuntu:20.04
   extends:
     - .save_warp_bin_artifact
   before_script:
@@ -94,7 +94,7 @@ mac-x86_64 build:
     - !reference [.snippets, install-python+warp-aarch64]
     - echo -e "\\e[0Ksection_end:`date +%s`:install_dependencies\\r\\e[0K"
   script:
-    - python -m warp.tests --junit-report-xml rspec.xml -s autodetect
+    - python -m warp.tests --junit-report-xml rspec.xml -s autodetect --failfast
   tags:
     - arch/arm
 
@@ -114,11 +114,13 @@ linux-x86_64 test:
     - python -m pip install --upgrade pip
     - python -m pip install --upgrade usd-core
     - python -m pip install --upgrade torch --extra-index-url https://download.pytorch.org/whl/cu121
-    - python -m pip install --upgrade "jax[cuda12_pip]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+    - python -m pip install -U "jax[cuda12]"
     - python -m pip install -e .
     - echo -e "\\e[0Ksection_end:`date +%s`:install_dependencies\\r\\e[0K"
+    # HACK: disable P2P tests due to misbehaving agents
+    - export WARP_DISABLE_P2P_TESTS=1
   script:
-    - python -m warp.tests --junit-report-xml rspec.xml -s autodetect
+    - python -m warp.tests --junit-report-xml rspec.xml -s autodetect --failfast
 
 windows-x86_64 test:
   stage: test
@@ -135,18 +137,12 @@ windows-x86_64 test:
     - '& $env:CI_PROJECT_DIR\_build\target-deps\python\python.exe -m venv _venv'
     - .\_venv\Scripts\Activate.ps1
     - python -m pip install --upgrade pip
-    - python -m pip install --upgrade usd-core
-    # Temporary HACK: use NumPy < 2.0 on Windows due to issues with Torch wheels that are not compatible
-    # https://github.com/pytorch/pytorch/issues/128860
-    - python -m pip install "numpy<2"
+    - python -m pip install --upgrade usd-core numpy
     - python -m pip install --upgrade torch --extra-index-url https://download.pytorch.org/whl/cu121
     - python -m pip install -e .
     - Write-Output "$([char]27)[0Ksection_end:$(GetTime):install_dependencies$([char]13)$([char]27)[0K"
   script:
-    - python -m warp.tests --junit-report-xml rspec.xml -s autodetect
-  tags:
-    - os/windows
-    - gpu/2x-A5000
+    - python -m warp.tests --junit-report-xml rspec.xml -s autodetect --failfast
 
 mac-x86_64 test:
   stage: test
@@ -161,7 +157,7 @@ mac-x86_64 test:
     - python -m pip install --upgrade usd-core
     - echo -e "\\e[0Ksection_end:`date +%s`:install_dependencies\\r\\e[0K"
   script:
-    - python -m warp.tests --junit-report-xml rspec.xml -s autodetect
+    - python -m warp.tests --junit-report-xml rspec.xml -s autodetect --failfast
 
 # ==============================================================================
 # Packaging Jobs

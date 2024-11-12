@@ -7,7 +7,7 @@ regular Python functions and JIT compiles them to efficient kernel code that can
 Warp is designed for `spatial computing <https://en.wikipedia.org/wiki/Spatial_computing>`_
 and comes with a rich set of primitives that make it easy to write 
 programs for physics simulation, perception, robotics, and geometry processing. In addition, Warp kernels 
-are differentiable and can be used as part of machine-learning pipelines with frameworks such as PyTorch and JAX.
+are differentiable and can be used as part of machine-learning pipelines with frameworks such as PyTorch, JAX and Paddle.
 
 Below are some examples of simulations implemented using Warp:
 
@@ -141,30 +141,30 @@ warp/examples/fem
 .. list-table::
     :class: gallery
 
-    * - .. image:: ./img/examples/fem_apic_fluid.png
-           :target: https://github.com/NVIDIA/warp/tree/main/warp/examples/fem/example_apic_fluid.py
-      - .. image:: ./img/examples/fem_convection_diffusion.png
-           :target: https://github.com/NVIDIA/warp/tree/main/warp/examples/fem/example_convection_diffusion.py
-      - .. image:: ./img/examples/fem_diffusion_3d.png
+    * - .. image:: ./img/examples/fem_diffusion_3d.png
            :target: https://github.com/NVIDIA/warp/tree/main/warp/examples/fem/example_diffusion_3d.py
-      - .. image:: ./img/examples/fem_diffusion.png
-           :target: https://github.com/NVIDIA/warp/tree/main/warp/examples/fem/example_diffusion.py
-    * - apic fluid
-      - convection diffusion
-      - diffusion 3d
-      - diffusion
-    * - .. image:: ./img/examples/fem_mixed_elasticity.png
+      - .. image:: ./img/examples/fem_mixed_elasticity.png
            :target: https://github.com/NVIDIA/warp/tree/main/warp/examples/fem/example_mixed_elasticity.py
+      - .. image:: ./img/examples/fem_apic_fluid.png
+           :target: https://github.com/NVIDIA/warp/tree/main/warp/examples/fem/example_apic_fluid.py
+      - .. image:: ./img/examples/fem_streamlines.png
+           :target: https://github.com/NVIDIA/warp/tree/main/warp/examples/fem/example_streamlines.py
+    * - diffusion 3d
+      - mixed elasticity
+      - apic fluid
+      - streamlines
+    * - .. image:: ./img/examples/fem_convection_diffusion.png
+           :target: https://github.com/NVIDIA/warp/tree/main/warp/examples/fem/example_convection_diffusion.py
       - .. image:: ./img/examples/fem_navier_stokes.png
            :target: https://github.com/NVIDIA/warp/tree/main/warp/examples/fem/example_navier_stokes.py
-      - .. image:: ./img/examples/fem_stokes_transfer.png
-           :target: https://github.com/NVIDIA/warp/tree/main/warp/examples/fem/example_stokes_transfer.py
-      - .. image:: ./img/examples/fem_stokes.png
-           :target: https://github.com/NVIDIA/warp/tree/main/warp/examples/fem/example_stokes.py
-    * - mixed elasticity
+      - .. image:: ./img/examples/fem_burgers.png
+           :target: https://github.com/NVIDIA/warp/tree/main/warp/examples/fem/example_burgers.py
+      - .. image:: ./img/examples/fem_magnetostatics.png
+           :target: https://github.com/NVIDIA/warp/tree/main/warp/examples/fem/example_magnetostatics.py
+    * - convection diffusion
       - navier stokes
-      - stokes transfer
-      - stokes
+      - burgers
+      - magnetostatics
 
 warp/examples/optim
 ^^^^^^^^^^^^^^^^^^^
@@ -262,13 +262,14 @@ Learn More
 Please see the following resources for additional background on Warp:
 
 - `Product Page <https://developer.nvidia.com/warp-python>`_
+-  `SIGGRAPH 2024 Course Slides <https://dl.acm.org/doi/10.1145/3664475.3664543>`_
+-  `GTC 2024 Presentation <https://www.nvidia.com/en-us/on-demand/session/gtc24-s63345>`_
 -  `GTC 2022
    Presentation <https://www.nvidia.com/en-us/on-demand/session/gtcspring22-s41599>`_
 -  `GTC 2021
    Presentation <https://www.nvidia.com/en-us/on-demand/session/gtcspring21-s31838>`_
 -  `SIGGRAPH Asia 2021 Differentiable Simulation
    Course <https://dl.acm.org/doi/abs/10.1145/3476117.3483433>`_
--  `GTC 2024 Presentation <https://www.nvidia.com/en-us/on-demand/session/gtc24-s63345>`_
 
 The underlying technology in Warp has been used in a number of research
 projects at NVIDIA including the following publications:
@@ -292,7 +293,7 @@ Support
 Problems, questions, and feature requests can be opened on
 `GitHub Issues <https://github.com/NVIDIA/warp/issues>`_.
 
-The Warp team also monitors the **#warp** channel on the public
+The Warp team also monitors the **#warp** forum on the public
 `Omniverse Discord <https://discord.com/invite/nvidiaomniverse>`_ server, come chat with us!
 
 Versioning
@@ -319,8 +320,7 @@ Contributing
 
 Contributions and pull requests from the community are welcome and are taken under the
 terms described in the **Feedback** section of `LICENSE.md <https://github.com/NVIDIA/warp/blob/main/LICENSE.md#9-feedback>`__.
-`CONTRIBUTING.md <https://github.com/NVIDIA/warp/blob/main/CONTRIBUTING.md>`_ provides additional information on
-how to open a pull request for Warp.
+Please see the :doc:`modules/contribution_guide` for more information on contributing to the development of Warp.
 
 Citing
 ------
@@ -350,16 +350,20 @@ Full Table of Contents
     modules/devices
     modules/differentiability
     modules/generics
+    modules/tiles
     modules/interoperability
     configuration
     debugging
     limitations
+    modules/contribution_guide
     faq
+    changelog
 
 .. toctree::
     :maxdepth: 2
     :caption: Advanced Topics
 
+    codegen
     modules/allocators
     modules/concurrency
     profiling
@@ -386,6 +390,6 @@ Full Table of Contents
 
     GitHub <https://github.com/NVIDIA/warp>
     PyPI <https://pypi.org/project/warp-lang>
-    Discord <https://discord.com/channels/827959428476174346/953756751977648148>
+    Discord <https://discord.com/channels/827959428476174346/1285719658325999686>
 
 :ref:`Full Index <genindex>`

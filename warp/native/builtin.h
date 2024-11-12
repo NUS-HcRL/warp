@@ -748,7 +748,7 @@ inline CUDA_CALLABLE half floordiv(half a, half b)
 #if FP_CHECK
     if (!isfinite(a) || !isfinite(b) || float(b) == 0.0f)
     {
-        printf("%s:%d mod(%f, %f)\n", __FILE__, __LINE__, float(a), float(b));
+        printf("%s:%d floordiv(%f, %f)\n", __FILE__, __LINE__, float(a), float(b));
         assert(0);
     }
 #endif
@@ -759,7 +759,7 @@ inline CUDA_CALLABLE float floordiv(float a, float b)
 #if FP_CHECK
     if (!isfinite(a) || !isfinite(b) || b == 0.0f)
     {
-        printf("%s:%d mod(%f, %f)\n", __FILE__, __LINE__, a, b);
+        printf("%s:%d floordiv(%f, %f)\n", __FILE__, __LINE__, a, b);
         assert(0);
     }
 #endif
@@ -770,7 +770,7 @@ inline CUDA_CALLABLE double floordiv(double a, double b)
 #if FP_CHECK
     if (!isfinite(a) || !isfinite(b) || b == 0.0)
     {
-        printf("%s:%d mod(%f, %f)\n", __FILE__, __LINE__, a, b);
+        printf("%s:%d floordiv(%f, %f)\n", __FILE__, __LINE__, a, b);
         assert(0);
     }
 #endif
@@ -1145,7 +1145,47 @@ struct launch_bounds_t
     size_t size;                // total number of threads
 };
 
-inline CUDA_CALLABLE int tid(size_t index)
+// represents coordinate in the launch grid
+struct launch_coord_t
+{
+    int i;
+    int j;
+    int k;
+    int l;
+};
+
+// unravels a linear thread index to the corresponding launch grid coord (up to 4d)
+inline CUDA_CALLABLE launch_coord_t launch_coord(size_t linear, const launch_bounds_t& bounds)
+{
+    launch_coord_t coord = {0, 0, 0, 0};
+
+    if (bounds.ndim > 3)
+    {
+        coord.l = linear%bounds.shape[3];
+        linear /= bounds.shape[3];
+    }
+
+    if (bounds.ndim > 2)
+    {
+        coord.k = linear%bounds.shape[2];
+        linear /= bounds.shape[2];
+    }
+
+    if (bounds.ndim > 1)
+    {
+        coord.j = linear%bounds.shape[1];
+        linear /= bounds.shape[1];
+    }
+
+    if (bounds.ndim > 0)
+    {
+        coord.i = linear;
+    }
+
+    return coord;
+}
+
+inline CUDA_CALLABLE int tid(size_t index, const launch_bounds_t& bounds)
 {
     // For the 1-D tid() we need to warn the user if we're about to provide a truncated index
     // Only do this in _DEBUG when called from device to avoid excessive register allocation
@@ -1154,40 +1194,33 @@ inline CUDA_CALLABLE int tid(size_t index)
         printf("Warp warning: tid() is returning an overflowed int\n");
     }
 #endif
-    return static_cast<int>(index);
+
+    launch_coord_t c = launch_coord(index, bounds);
+    return static_cast<int>(c.i);
 }
 
-inline CUDA_CALLABLE_DEVICE void tid(int& i, int& j, size_t index, const launch_bounds_t& launch_bounds)
+inline CUDA_CALLABLE_DEVICE void tid(int& i, int& j, size_t index, const launch_bounds_t& bounds)
 {
-    const size_t n = launch_bounds.shape[1];
-
-    // convert to work item
-    i = index/n;
-    j = index%n;
+    launch_coord_t c = launch_coord(index, bounds);
+    i = c.i;
+    j = c.j;
 }
 
-inline CUDA_CALLABLE_DEVICE void tid(int& i, int& j, int& k, size_t index, const launch_bounds_t& launch_bounds)
+inline CUDA_CALLABLE_DEVICE void tid(int& i, int& j, int& k, size_t index, const launch_bounds_t& bounds)
 {
-    const size_t n = launch_bounds.shape[1];
-    const size_t o = launch_bounds.shape[2];
-
-    // convert to work item
-    i = index/(n*o);
-    j = index%(n*o)/o;
-    k = index%o;
+    launch_coord_t c = launch_coord(index, bounds);
+    i = c.i;
+    j = c.j;
+    k = c.k;
 }
 
-inline CUDA_CALLABLE_DEVICE void tid(int& i, int& j, int& k, int& l, size_t index, const launch_bounds_t& launch_bounds)
+inline CUDA_CALLABLE_DEVICE void tid(int& i, int& j, int& k, int& l, size_t index, const launch_bounds_t& bounds)
 {
-    const size_t n = launch_bounds.shape[1];
-    const size_t o = launch_bounds.shape[2];
-    const size_t p = launch_bounds.shape[3];
-
-    // convert to work item
-    i = index/(n*o*p);
-    j = index%(n*o*p)/(o*p);
-    k = index%(o*p)/p;
-    l = index%p;
+    launch_coord_t c = launch_coord(index, bounds);
+    i = c.i;
+    j = c.j;
+    k = c.k;
+    l = c.l;
 }
 
 template<typename T>
@@ -1240,7 +1273,7 @@ inline CUDA_CALLABLE float16 atomic_add(float16* buf, float16 value)
 
 }
 
-// emulate atomic float max
+// emulate atomic float max with atomicCAS()
 inline CUDA_CALLABLE float atomic_max(float* address, float val)
 {
 #if defined(__CUDA_ARCH__)
@@ -1263,7 +1296,7 @@ inline CUDA_CALLABLE float atomic_max(float* address, float val)
 #endif
 }
 
-// emulate atomic float min/max with atomicCAS()
+// emulate atomic float min with atomicCAS()
 inline CUDA_CALLABLE float atomic_min(float* address, float val)
 {
 #if defined(__CUDA_ARCH__)
@@ -1281,6 +1314,88 @@ inline CUDA_CALLABLE float atomic_min(float* address, float val)
 
 #else
     float old = *address;
+    *address = min(old, val);
+    return old;
+#endif
+}
+
+template<>
+inline CUDA_CALLABLE float64 atomic_add(float64* buf, float64 value)
+{
+#if !defined(__CUDA_ARCH__)
+    float64 old = buf[0];
+    buf[0] += value;
+    return old;
+#elif defined(__clang__)  // CUDA compiled by Clang
+	return atomicAdd(buf, value);
+#else  // CUDA compiled by NVRTC
+    
+    /* Define __PTR for atomicAdd prototypes below, undef after done */
+    #if (defined(_MSC_VER) && defined(_WIN64)) || defined(__LP64__) || defined(__CUDACC_RTC__)
+    #define __PTR   "l"
+    #else
+    #define __PTR   "r"
+    #endif /*(defined(_MSC_VER) && defined(_WIN64)) || defined(__LP64__) || defined(__CUDACC_RTC__)*/
+   
+    double r = 0.0;
+
+    #if __CUDA_ARCH__ >= 600
+
+        asm volatile ("{ atom.add.f64 %0,[%1],%2; }\n"
+                    : "=d"(r)
+                    : __PTR(buf), "d"(value)
+                    : "memory");
+    #endif
+
+    return r;
+
+    #undef __PTR
+
+#endif  // CUDA compiled by NVRTC
+
+}
+
+// emulate atomic double max with atomicCAS()
+inline CUDA_CALLABLE double atomic_max(double* address, double val)
+{
+#if defined(__CUDA_ARCH__)
+        unsigned long long int *address_as_ull = (unsigned long long int*)address;
+        unsigned long long int old = *address_as_ull, assumed;
+    
+	while (val > __longlong_as_double(old))
+	{
+        assumed = old;
+        old = atomicCAS(address_as_ull, assumed,
+                        __double_as_longlong(val));
+    }
+
+    return __longlong_as_double(old);
+
+#else
+    double old = *address;
+    *address = max(old, val);
+    return old;
+#endif
+}
+
+// emulate atomic double min with atomicCAS()
+inline CUDA_CALLABLE double atomic_min(double* address, double val)
+{
+#if defined(__CUDA_ARCH__)
+    unsigned long long int *address_as_ull = (unsigned long long int*)address;
+    unsigned long long int old = *address_as_ull, assumed;
+
+    while (val < __longlong_as_double(old)) 
+	{
+        assumed = old;
+        old = atomicCAS(address_as_ull, assumed,
+                        __double_as_longlong(val));
+    }
+
+    return __longlong_as_double(old);
+
+#else
+    double old = *address;
     *address = min(old, val);
     return old;
 #endif
@@ -1403,14 +1518,19 @@ inline CUDA_CALLABLE void print(const str s)
     printf("%s\n", s);
 }
 
-inline CUDA_CALLABLE void print(int i)
+inline CUDA_CALLABLE void print(signed char i)
 {
     printf("%d\n", i);
 }
 
 inline CUDA_CALLABLE void print(short i)
 {
-    printf("%hd\n", i);
+    printf("%d\n", i);
+}
+
+inline CUDA_CALLABLE void print(int i)
+{
+    printf("%d\n", i);
 }
 
 inline CUDA_CALLABLE void print(long i)
@@ -1423,14 +1543,19 @@ inline CUDA_CALLABLE void print(long long i)
     printf("%lld\n", i);
 }
 
-inline CUDA_CALLABLE void print(unsigned i)
+inline CUDA_CALLABLE void print(unsigned char i)
 {
     printf("%u\n", i);
 }
 
 inline CUDA_CALLABLE void print(unsigned short i)
 {
-    printf("%hu\n", i);
+    printf("%u\n", i);
+}
+
+inline CUDA_CALLABLE void print(unsigned int i)
+{
+    printf("%u\n", i);
 }
 
 inline CUDA_CALLABLE void print(unsigned long i)
@@ -1441,6 +1566,11 @@ inline CUDA_CALLABLE void print(unsigned long i)
 inline CUDA_CALLABLE void print(unsigned long long i)
 {
     printf("%llu\n", i);
+}
+
+inline CUDA_CALLABLE void print(bool b)
+{
+    printf(b ? "True\n" : "False\n");
 }
 
 template<unsigned Length, typename Type>
@@ -1478,32 +1608,73 @@ inline CUDA_CALLABLE void print(transform_t<Type> t)
     printf("(%g %g %g) (%g %g %g %g)\n", float(t.p[0]), float(t.p[1]), float(t.p[2]), float(t.q.x), float(t.q.y), float(t.q.z), float(t.q.w));
 }
 
-inline CUDA_CALLABLE void adj_print(int i, int adj_i) { printf("%d adj: %d\n", i, adj_i); }
-inline CUDA_CALLABLE void adj_print(float f, float adj_f) { printf("%g adj: %g\n", f, adj_f); }
-inline CUDA_CALLABLE void adj_print(short f, short adj_f) { printf("%hd adj: %hd\n", f, adj_f); }
-inline CUDA_CALLABLE void adj_print(long f, long adj_f) { printf("%ld adj: %ld\n", f, adj_f); }
-inline CUDA_CALLABLE void adj_print(long long f, long long adj_f) { printf("%lld adj: %lld\n", f, adj_f); }
-inline CUDA_CALLABLE void adj_print(unsigned f, unsigned adj_f) { printf("%u adj: %u\n", f, adj_f); }
-inline CUDA_CALLABLE void adj_print(unsigned short f, unsigned short adj_f) { printf("%hu adj: %hu\n", f, adj_f); }
-inline CUDA_CALLABLE void adj_print(unsigned long f, unsigned long adj_f) { printf("%lu adj: %lu\n", f, adj_f); }
-inline CUDA_CALLABLE void adj_print(unsigned long long f, unsigned long long adj_f) { printf("%llu adj: %llu\n", f, adj_f); }
-inline CUDA_CALLABLE void adj_print(half h, half adj_h) { printf("%g adj: %g\n", half_to_float(h), half_to_float(adj_h)); }
-inline CUDA_CALLABLE void adj_print(double f, double adj_f) { printf("%g adj: %g\n", f, adj_f); }
+template<typename T>
+inline CUDA_CALLABLE void adj_print(const T& x, const T& adj_x)
+{
+    printf("adj: <type without print implementation>\n");
+}
+
+// note: adj_print() only prints the adjoint value, since the value itself gets printed in replay print()
+inline CUDA_CALLABLE void adj_print(half x, half adj_x) { printf("adj: %g\n", half_to_float(adj_x)); }
+inline CUDA_CALLABLE void adj_print(float x, float adj_x) { printf("adj: %g\n", adj_x); }
+inline CUDA_CALLABLE void adj_print(double x, double adj_x) { printf("adj: %g\n", adj_x); }
+
+inline CUDA_CALLABLE void adj_print(signed char x, signed char adj_x) { printf("adj: %d\n", adj_x); }
+inline CUDA_CALLABLE void adj_print(short x, short adj_x) { printf("adj: %d\n", adj_x); }
+inline CUDA_CALLABLE void adj_print(int x, int adj_x) { printf("adj: %d\n", adj_x); }
+inline CUDA_CALLABLE void adj_print(long x, long adj_x) { printf("adj: %ld\n", adj_x); }
+inline CUDA_CALLABLE void adj_print(long long x, long long adj_x) { printf("adj: %lld\n", adj_x); }
+
+inline CUDA_CALLABLE void adj_print(unsigned char x, unsigned char adj_x) { printf("adj: %u\n", adj_x); }
+inline CUDA_CALLABLE void adj_print(unsigned short x, unsigned short adj_x) { printf("adj: %u\n", adj_x); }
+inline CUDA_CALLABLE void adj_print(unsigned x, unsigned adj_x) { printf("adj: %u\n", adj_x); }
+inline CUDA_CALLABLE void adj_print(unsigned long x, unsigned long adj_x) { printf("adj: %lu\n", adj_x); }
+inline CUDA_CALLABLE void adj_print(unsigned long long x, unsigned long long adj_x) { printf("adj: %llu\n", adj_x); }
+
+inline CUDA_CALLABLE void adj_print(bool x, bool adj_x) { printf("adj: %s\n", (adj_x ? "True" : "False")); }
 
 template<unsigned Length, typename Type>
-inline CUDA_CALLABLE void adj_print(vec_t<Length, Type> v, vec_t<Length, Type>& adj_v) { printf("%g %g adj: %g %g \n", v[0], v[1], adj_v[0], adj_v[1]); }
+inline CUDA_CALLABLE void adj_print(const vec_t<Length, Type>& v, const vec_t<Length, Type>& adj_v)
+{
+    printf("adj:");
+    for (unsigned i = 0; i < Length; i++)
+        printf(" %g", float(adj_v[i]));
+    printf("\n");
+}
 
 template<unsigned Rows, unsigned Cols, typename Type>
-inline CUDA_CALLABLE void adj_print(mat_t<Rows, Cols, Type> m, mat_t<Rows, Cols, Type>& adj_m) { }
+inline CUDA_CALLABLE void adj_print(const mat_t<Rows, Cols, Type>& m, const mat_t<Rows, Cols, Type>& adj_m)
+{
+    for (unsigned i = 0; i < Rows; i++)
+    {
+        if (i == 0)
+            printf("adj:");
+        else
+            printf("    ");
+        for (unsigned j = 0; j < Cols; j++)
+            printf(" %g", float(adj_m.data[i][j]));
+        printf("\n");
+    }
+}
 
 template<typename Type>
-inline CUDA_CALLABLE void adj_print(quat_t<Type> q, quat_t<Type>& adj_q) { printf("%g %g %g %g adj: %g %g %g %g\n", q.x, q.y, q.z, q.w, adj_q.x, adj_q.y, adj_q.z, adj_q.w); }
+inline CUDA_CALLABLE void adj_print(const quat_t<Type>& q, const quat_t<Type>& adj_q)
+{
+    printf("adj: %g %g %g %g\n", float(adj_q.x), float(adj_q.y), float(adj_q.z), float(adj_q.w));
+}
 
 template<typename Type>
-inline CUDA_CALLABLE void adj_print(transform_t<Type> t, transform_t<Type>& adj_t) {}
+inline CUDA_CALLABLE void adj_print(const transform_t<Type>& t, const transform_t<Type>& adj_t)
+{
+    printf("adj: (%g %g %g) (%g %g %g %g)\n",
+        float(adj_t.p[0]), float(adj_t.p[1]), float(adj_t.p[2]),
+        float(adj_t.q.x), float(adj_t.q.y), float(adj_t.q.z), float(adj_t.q.w));
+}
 
-inline CUDA_CALLABLE void adj_print(str t, str& adj_t) {}
-
+inline CUDA_CALLABLE void adj_print(str t, str& adj_t)
+{
+    printf("adj: %s\n", t);
+}
 
 template <typename T>
 inline CUDA_CALLABLE void expect_eq(const T& actual, const T& expected)
@@ -1586,3 +1757,10 @@ inline CUDA_CALLABLE void adj_expect_near(const vec3& actual, const vec3& expect
 #include "rand.h"
 #include "noise.h"
 #include "matnn.h"
+
+// only include in kernels for now
+#if defined(__CUDACC_RTC__)
+#include "tile.h"
+#include "tile_gemm.h"
+#include "tile_reduce.h"
+#endif
