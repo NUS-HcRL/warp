@@ -39,6 +39,11 @@ class Geometry:
         raise NotImplementedError
 
     @property
+    def cell_dimension(self) -> int:
+        """Manifold dimension of the geometry cells"""
+        return self.reference_cell().dimension
+
+    @property
     def name(self) -> str:
         return self.__class__.__name__
 
@@ -54,7 +59,6 @@ class Geometry:
     SideIndexArg: wp.codegen.Struct
     """Structure containing arguments to be passed to device functions for indexing sides"""
 
-    @staticmethod
     def cell_arg_value(self, device) -> "Geometry.CellArg":
         """Value of the arguments to be passed to cell-related device functions"""
         raise NotImplementedError
@@ -70,7 +74,7 @@ class Geometry:
         raise NotImplementedError
 
     @staticmethod
-    def cell_inverse_deformation_gradient(args: "Geometry.CellArg", cell_index: ElementIndex, coords: Coords):
+    def cell_inverse_deformation_gradient(args: "Geometry.CellArg", s: "Sample"):
         """Device function returning the matrix right-transforming a gradient w.r.t. cell space to a gradient w.r.t. world space
         (i.e. the inverse deformation gradient)
         """
@@ -102,7 +106,6 @@ class Geometry:
         For elements with the same dimension as the embedding space, this will be zero."""
         raise NotImplementedError
 
-    @staticmethod
     def side_arg_value(self, device) -> "Geometry.SideArg":
         """Value of the arguments to be passed to side-related device functions"""
         raise NotImplementedError

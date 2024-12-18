@@ -398,6 +398,49 @@ def test_tile_sum(test, device):
     assert_np_equal(input_wp.grad.numpy(), np.ones_like(input) * 0.5)
 
 
+def test_tile_sum_launch(test, device):
+    batch_count = 56
+
+    M = TILE_M
+    N = TILE_N
+
+    rng = np.random.default_rng(42)
+    input = rng.random((batch_count, M, N), dtype=np.float32)
+
+    input_wp = wp.array(input, requires_grad=True, device=device)
+    output_wp = wp.zeros(batch_count, requires_grad=True, device=device)
+
+    cmd = wp.launch_tiled(
+        tile_sum_kernel,
+        dim=[batch_count],
+        inputs=[input_wp, output_wp],
+        block_dim=TILE_DIM,
+        device=device,
+        record_cmd=True,
+    )
+    cmd.launch()
+
+    sum_wp = output_wp.numpy()
+
+    for i in range(batch_count):
+        sum_np = np.sum(input[i]) * 0.5
+        test.assertAlmostEqual(sum_wp[i], sum_np, places=5)
+
+    output_wp.grad.fill_(1.0)
+
+    wp.launch_tiled(
+        tile_sum_kernel,
+        dim=[batch_count],
+        inputs=[input_wp, output_wp],
+        adj_inputs=[input_wp.grad, output_wp.grad],
+        block_dim=TILE_DIM,
+        device=device,
+        adjoint=True,
+    )
+
+    assert_np_equal(input_wp.grad.numpy(), np.ones_like(input) * 0.5)
+
+
 @wp.kernel
 def tile_extract_kernel(input: wp.array2d(dtype=float), output: wp.array2d(dtype=float)):
     # output tile index
@@ -520,7 +563,76 @@ def test_tile_broadcast_grad(test, device):
     b.grad = wp.ones_like(b, device=device)
     tape.backward()
 
+    assert_np_equal(b.numpy(), a.numpy() + np.ones((5, 5)))
     assert_np_equal(a.grad.numpy(), np.ones(5) * 5.0)
+
+
+TILE_VIEW_M = 16
+TILE_VIEW_N = 128
+
+
+@wp.kernel
+def test_tile_view_kernel(src: wp.array2d(dtype=float), dst: wp.array2d(dtype=float)):
+    # load whole source into local memory
+    a = wp.tile_load(src, 0, 0, TILE_VIEW_M, TILE_VIEW_N)
+
+    # copy the source array row by row
+    for i in range(TILE_VIEW_M):
+        # create a view on original array and store
+        row = a[i]
+        wp.tile_store(dst, i, 0, row)
+
+
+def test_tile_view(test, device):
+    rng = np.random.default_rng(42)
+
+    a = wp.array(rng.random((TILE_VIEW_M, TILE_VIEW_N), dtype=np.float32), requires_grad=True, device=device)
+    b = wp.array(np.zeros((TILE_VIEW_M, TILE_VIEW_N), dtype=np.float32), requires_grad=True, device=device)
+
+    with wp.Tape() as tape:
+        wp.launch_tiled(test_tile_view_kernel, dim=[1], inputs=[a, b], block_dim=32, device=device)
+
+    assert_np_equal(b.numpy(), a.numpy())
+
+    b.grad = wp.ones_like(b, device=device)
+    tape.backward()
+
+    assert_np_equal(a.grad.numpy(), np.ones_like(a.numpy()))
+
+
+@wp.kernel
+def test_tile_assign_kernel(src: wp.array2d(dtype=float), dst: wp.array2d(dtype=float)):
+    # load whole source into local memory
+    a = wp.tile_load(src, 0, 0, m=TILE_VIEW_M, n=TILE_VIEW_N)
+    b = wp.tile_zeros(dtype=float, m=TILE_VIEW_M, n=TILE_VIEW_N)
+
+    # copy the source array row by row
+    for i in range(TILE_VIEW_M):
+        # create views onto source and dest rows
+        row_src = a[i]
+        row_dst = b[i]
+
+        # copy onto dest row
+        wp.tile_assign(row_dst, 0, 0, row_src)
+
+    wp.tile_store(dst, 0, 0, b)
+
+
+def test_tile_assign(test, device):
+    rng = np.random.default_rng(42)
+
+    a = wp.array(rng.random((TILE_VIEW_M, TILE_VIEW_N), dtype=np.float32), requires_grad=True, device=device)
+    b = wp.array(np.zeros((TILE_VIEW_M, TILE_VIEW_N), dtype=np.float32), requires_grad=True, device=device)
+
+    with wp.Tape() as tape:
+        wp.launch_tiled(test_tile_assign_kernel, dim=[1], inputs=[a, b], block_dim=32, device=device)
+
+    assert_np_equal(b.numpy(), a.numpy())
+
+    b.grad = wp.ones_like(b, device=device)
+    tape.backward()
+
+    assert_np_equal(a.grad.numpy(), np.ones_like(a.numpy()))
 
 
 # #-----------------------------------------
@@ -619,9 +731,12 @@ add_function_test(TestTile, "test_tile_transpose", test_tile_transpose, devices=
 add_function_test(TestTile, "test_tile_transpose_matmul", test_tile_transpose_matmul, devices=devices)
 add_function_test(TestTile, "test_tile_operators", test_tile_operators, devices=devices)
 add_function_test(TestTile, "test_tile_sum", test_tile_sum, devices=devices)
+add_function_test(TestTile, "test_tile_sum_launch", test_tile_sum_launch, devices=devices)
 add_function_test(TestTile, "test_tile_extract", test_tile_extract, devices=devices)
 add_function_test(TestTile, "test_tile_broadcast_add", test_tile_broadcast_add, devices=devices)
 add_function_test(TestTile, "test_tile_broadcast_grad", test_tile_broadcast_grad, devices=devices)
+add_function_test(TestTile, "test_tile_view", test_tile_view, devices=devices)
+add_function_test(TestTile, "test_tile_assign", test_tile_assign, devices=devices)
 
 
 if __name__ == "__main__":

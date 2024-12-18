@@ -399,11 +399,11 @@ def scalar_infer_type(arg_types: Mapping[str, type]):
 
     scalar_types = set()
     for t in arg_types:
-        t = strip_reference(t)
-        if hasattr(t, "_wp_scalar_type_"):
-            scalar_types.add(t._wp_scalar_type_)
-        elif t in scalar_and_bool_types:
-            scalar_types.add(t)
+        t_val = strip_reference(t)
+        if hasattr(t_val, "_wp_scalar_type_"):
+            scalar_types.add(t_val._wp_scalar_type_)
+        elif t_val in scalar_and_bool_types:
+            scalar_types.add(t_val)
 
     if len(scalar_types) > 1:
         raise RuntimeError(
@@ -1751,11 +1751,12 @@ def tile_zeros_dispatch_func(arg_types: Mapping[str, type], return_type: Any, ar
 
 add_builtin(
     "tile_zeros",
-    input_types={"m": int, "n": int, "dtype": Scalar, "storage": str},
+    input_types={"m": int, "n": int, "dtype": Any, "storage": str},
     defaults={"storage": "register"},
     value_func=tile_zeros_value_func,
     dispatch_func=tile_zeros_dispatch_func,
-    variadic=True,
+    variadic=False,
+    missing_grad=True,
     doc="""Allocates a tile of zero-initialized items.
 
     :param m: Size of the first dimension of the output tile
@@ -1807,11 +1808,11 @@ def tile_ones_dispatch_func(arg_types: Mapping[str, type], return_type: Any, arg
 
 add_builtin(
     "tile_ones",
-    input_types={"m": int, "n": int, "dtype": Scalar, "storage": str},
+    input_types={"m": int, "n": int, "dtype": Any, "storage": str},
     defaults={"storage": "register"},
     value_func=tile_ones_value_func,
     dispatch_func=tile_ones_dispatch_func,
-    variadic=True,
+    missing_grad=True,
     doc="""Allocates a tile of one-initialized items.
 
     :param m: Size of the first dimension of the output tile
@@ -1890,11 +1891,12 @@ def tile_arange_dispatch_func(arg_types: Mapping[str, type], return_type: Any, a
 
 add_builtin(
     "tile_arange",
-    input_types={"*args": Scalar, "dtype": Scalar, "storage": str},
+    input_types={"*args": Scalar, "dtype": Any, "storage": str},
     defaults={"dtype": None, "storage": "register"},
     value_func=tile_arange_value_func,
     dispatch_func=tile_arange_dispatch_func,
     variadic=True,
+    missing_grad=True,
     doc="""Generates a tile of linearly spaced elements.
 
     :param args: Variable-length positional arguments, interpreted as:
@@ -2191,6 +2193,92 @@ add_builtin(
 )
 
 
+def tile_view_value_func(arg_types, arg_values):
+    # return generic type (for doc builds)
+    if arg_types is None:
+        return Tile(dtype=Any, M=Any, N=Any)
+
+    tile = arg_types["t"]
+
+    if "m" not in arg_values:
+        m = 1
+    else:
+        m = arg_values["m"]
+
+    if "n" not in arg_values:
+        n = tile.N
+    else:
+        n = arg_values["n"]
+
+    if m > tile.M or n > tile.N:
+        raise RuntimeError(
+            f"Trying to view a tile subrange with dimensions ({m}, {n}) which is larger than source tile with dimensions ({tile.M}, {tile.N})"
+        )
+
+    # force source tile to shared memory
+    tile.storage = "shared"
+
+    output = Tile(dtype=tile.dtype, M=m, N=n, strides=tile.strides, layout=tile.layout, storage="shared", owner=False)
+    return output
+
+
+def tile_view_dispatch_func(arg_types: Mapping[str, type], return_type: Any, arg_values: Mapping[str, Var]):
+    tile = arg_values["t"]
+    i = arg_values["i"]
+
+    if "j" not in arg_values:
+        j = warp.codegen.Var(label=None, type=int, constant=0)
+    else:
+        j = arg_values["j"]
+
+    template_args = []
+    template_args.append(return_type.M)
+    template_args.append(return_type.N)
+
+    return ((tile, i, j), template_args)
+
+
+add_builtin(
+    "tile_view",
+    input_types={"t": Tile(dtype=Any, M=Any, N=Any), "i": int, "j": int, "m": int, "n": int},
+    value_func=tile_view_value_func,
+    dispatch_func=tile_view_dispatch_func,
+    defaults={"j": None, "m": None, "n": None},
+    variadic=True,
+    doc="""Return a subrange of a given tile from coordinates (i,j) to (i+m, j+n).
+
+    :param t: Input tile to extract a subrange from
+    :param i: Offset in the source tile along the first dimension
+    :param j: Offset in the source tile along the second dimensions
+    :param m: Size of the subrange to return along the first dimension
+    :param n: Size of the subrange to return along the second dimension
+    :returns: A tile with dimensions (m,n) and the same datatype as the input tile""",
+    group="Tile Primitives",
+    export=False,
+)
+
+
+def tile_assign_value_func(arg_types, arg_values):
+    # return generic type (for doc builds)
+    return None
+
+
+add_builtin(
+    "tile_assign",
+    input_types={"dst": Tile(dtype=Any, M=Any, N=Any), "i": int, "j": int, "src": Tile(dtype=Any, M=Any, N=Any)},
+    value_func=tile_assign_value_func,
+    #    dispatch_func=tile_assign_dispatch_func,
+    doc="""Assign a tile to a subrange of a destination tile at coordinates (i,j).
+
+    :param t: The destination tile to assign to
+    :param i: Offset in the source tile along the first dimension
+    :param j: Offset in the source tile along the second dimensions
+    :param src: The source tile to read values from""",
+    group="Tile Primitives",
+    export=False,
+)
+
+
 def tile_value_func(arg_types, arg_values):
     # return generic type (for doc builds)
     if arg_types is None:
@@ -2382,7 +2470,16 @@ def tile_transpose_value_func(arg_types, arg_values):
     # force the input tile to shared memory
     t.storage = "shared"
 
-    return Tile(dtype=t.dtype, M=t.N, N=t.M, op="transpose", storage=t.storage, layout=layout, owner=False)
+    return Tile(
+        dtype=t.dtype,
+        M=t.N,
+        N=t.M,
+        op="transpose",
+        storage=t.storage,
+        strides=t.strides[::-1],
+        layout=layout,
+        owner=False,
+    )
 
 
 add_builtin(
@@ -2439,9 +2536,9 @@ def tile_broadcast_value_func(arg_types, arg_values):
     # force the input tile to shared memory
     t.storage = "shared"
 
-    tile_type = Tile(dtype=t.dtype, M=m, N=n, op="broadcast", storage=t.storage, owner=False)
-    tile_type.strides = (stride_m, stride_n)
-
+    tile_type = Tile(
+        dtype=t.dtype, M=m, N=n, op="broadcast", storage=t.storage, strides=(stride_m, stride_n), owner=False
+    )
     return tile_type
 
 
@@ -3979,7 +4076,11 @@ add_builtin(
     doc="Return a random float between [low, high).",
 )
 add_builtin(
-    "randn", input_types={"state": uint32}, value_type=float, group="Random", doc="Sample a normal distribution."
+    "randn",
+    input_types={"state": uint32},
+    value_type=float,
+    group="Random",
+    doc="Sample a normal (Gaussian) distribution of mean 0 and variance 1. ",
 )
 
 add_builtin(
@@ -4151,12 +4252,20 @@ add_builtin(
 )
 
 
+def printf_value_func(arg_types: Mapping[str, type], arg_values: Mapping[str, Any]):
+    if arg_types is not None:
+        if len(arg_types.get("args", ())) > 32:
+            raise RuntimeError("the maximum number of variadic arguments that can be passed to `printf` is 32")
+
+    return None
+
+
 def printf_dispatch_func(input_types: Mapping[str, type], return_type: Any, args: Mapping[str, Var]):
     # We're in the codegen stage where we emit the code calling the built-in.
     # Further validate the given argument values if needed and map them
     # to the underlying C++ function's runtime and template params.
 
-    func_args = (args["fmt"], *args["args"])
+    func_args = (args["fmt"], *args.get("args", ()))
     template_args = ()
     return (func_args, template_args)
 
@@ -4167,6 +4276,7 @@ add_builtin(
     input_types={"fmt": str, "*args": Any},
     namespace="",
     variadic=True,
+    value_func=printf_value_func,
     dispatch_func=printf_dispatch_func,
     group="Utility",
     doc="Allows printing formatted strings using C-style format specifiers.",
@@ -4555,6 +4665,19 @@ def atomic_op_value_func(arg_types: Mapping[str, type], arg_values: Mapping[str,
     return arr_type.dtype
 
 
+def atomic_op_dispatch_func(input_types: Mapping[str, type], return_type: Any, args: Mapping[str, Var]):
+    # as this is a codegen callback, we can mark the fact that this func writes to an array here
+    if warp.config.verify_autograd_array_access:
+        arr = args["arr"]
+        arr.mark_write()
+
+    func_args = tuple(args.values())
+    # we don't need to specify template arguments for atomic ops
+    template_args = ()
+
+    return (func_args, template_args)
+
+
 for array_type in array_types:
     # don't list indexed array operations explicitly in docs
     hidden = array_type == indexedarray
@@ -4565,6 +4688,7 @@ for array_type in array_types:
         input_types={"arr": array_type(dtype=Any), "i": Int, "value": Any},
         constraint=atomic_op_constraint,
         value_func=atomic_op_value_func,
+        dispatch_func=atomic_op_dispatch_func,
         doc="Atomically add ``value`` onto ``arr[i]`` and return the old value.",
         group="Utility",
         skip_replay=True,
@@ -4575,6 +4699,7 @@ for array_type in array_types:
         input_types={"arr": array_type(dtype=Any), "i": Int, "j": Int, "value": Any},
         constraint=atomic_op_constraint,
         value_func=atomic_op_value_func,
+        dispatch_func=atomic_op_dispatch_func,
         doc="Atomically add ``value`` onto ``arr[i,j]`` and return the old value.",
         group="Utility",
         skip_replay=True,
@@ -4585,6 +4710,7 @@ for array_type in array_types:
         input_types={"arr": array_type(dtype=Any), "i": Int, "j": Int, "k": Int, "value": Any},
         constraint=atomic_op_constraint,
         value_func=atomic_op_value_func,
+        dispatch_func=atomic_op_dispatch_func,
         doc="Atomically add ``value`` onto ``arr[i,j,k]`` and return the old value.",
         group="Utility",
         skip_replay=True,
@@ -4595,6 +4721,7 @@ for array_type in array_types:
         input_types={"arr": array_type(dtype=Any), "i": Int, "j": Int, "k": Int, "l": Int, "value": Any},
         constraint=atomic_op_constraint,
         value_func=atomic_op_value_func,
+        dispatch_func=atomic_op_dispatch_func,
         doc="Atomically add ``value`` onto ``arr[i,j,k,l]`` and return the old value.",
         group="Utility",
         skip_replay=True,
@@ -4606,6 +4733,7 @@ for array_type in array_types:
         input_types={"arr": array_type(dtype=Any), "i": Int, "value": Any},
         constraint=atomic_op_constraint,
         value_func=atomic_op_value_func,
+        dispatch_func=atomic_op_dispatch_func,
         doc="Atomically subtract ``value`` onto ``arr[i]`` and return the old value.",
         group="Utility",
         skip_replay=True,
@@ -4616,6 +4744,7 @@ for array_type in array_types:
         input_types={"arr": array_type(dtype=Any), "i": Int, "j": Int, "value": Any},
         constraint=atomic_op_constraint,
         value_func=atomic_op_value_func,
+        dispatch_func=atomic_op_dispatch_func,
         doc="Atomically subtract ``value`` onto ``arr[i,j]`` and return the old value.",
         group="Utility",
         skip_replay=True,
@@ -4626,6 +4755,7 @@ for array_type in array_types:
         input_types={"arr": array_type(dtype=Any), "i": Int, "j": Int, "k": Int, "value": Any},
         constraint=atomic_op_constraint,
         value_func=atomic_op_value_func,
+        dispatch_func=atomic_op_dispatch_func,
         doc="Atomically subtract ``value`` onto ``arr[i,j,k]`` and return the old value.",
         group="Utility",
         skip_replay=True,
@@ -4636,6 +4766,7 @@ for array_type in array_types:
         input_types={"arr": array_type(dtype=Any), "i": Int, "j": Int, "k": Int, "l": Int, "value": Any},
         constraint=atomic_op_constraint,
         value_func=atomic_op_value_func,
+        dispatch_func=atomic_op_dispatch_func,
         doc="Atomically subtract ``value`` onto ``arr[i,j,k,l]`` and return the old value.",
         group="Utility",
         skip_replay=True,
@@ -4647,6 +4778,7 @@ for array_type in array_types:
         input_types={"arr": array_type(dtype=Any), "i": Int, "value": Any},
         constraint=atomic_op_constraint,
         value_func=atomic_op_value_func,
+        dispatch_func=atomic_op_dispatch_func,
         doc="""Compute the minimum of ``value`` and ``arr[i]``, atomically update the array, and return the old value.
 
     The operation is only atomic on a per-component basis for vectors and matrices.""",
@@ -4659,6 +4791,7 @@ for array_type in array_types:
         input_types={"arr": array_type(dtype=Any), "i": Int, "j": Int, "value": Any},
         constraint=atomic_op_constraint,
         value_func=atomic_op_value_func,
+        dispatch_func=atomic_op_dispatch_func,
         doc="""Compute the minimum of ``value`` and ``arr[i,j]``, atomically update the array, and return the old value.
 
     The operation is only atomic on a per-component basis for vectors and matrices.""",
@@ -4671,6 +4804,7 @@ for array_type in array_types:
         input_types={"arr": array_type(dtype=Any), "i": Int, "j": Int, "k": Int, "value": Any},
         constraint=atomic_op_constraint,
         value_func=atomic_op_value_func,
+        dispatch_func=atomic_op_dispatch_func,
         doc="""Compute the minimum of ``value`` and ``arr[i,j,k]``, atomically update the array, and return the old value.
 
     The operation is only atomic on a per-component basis for vectors and matrices.""",
@@ -4683,6 +4817,7 @@ for array_type in array_types:
         input_types={"arr": array_type(dtype=Any), "i": Int, "j": Int, "k": Int, "l": Int, "value": Any},
         constraint=atomic_op_constraint,
         value_func=atomic_op_value_func,
+        dispatch_func=atomic_op_dispatch_func,
         doc="""Compute the minimum of ``value`` and ``arr[i,j,k,l]``, atomically update the array, and return the old value.
 
     The operation is only atomic on a per-component basis for vectors and matrices.""",
@@ -4696,6 +4831,7 @@ for array_type in array_types:
         input_types={"arr": array_type(dtype=Any), "i": Int, "value": Any},
         constraint=atomic_op_constraint,
         value_func=atomic_op_value_func,
+        dispatch_func=atomic_op_dispatch_func,
         doc="""Compute the maximum of ``value`` and ``arr[i]``, atomically update the array, and return the old value.
 
     The operation is only atomic on a per-component basis for vectors and matrices.""",
@@ -4708,6 +4844,7 @@ for array_type in array_types:
         input_types={"arr": array_type(dtype=Any), "i": Int, "j": Int, "value": Any},
         constraint=atomic_op_constraint,
         value_func=atomic_op_value_func,
+        dispatch_func=atomic_op_dispatch_func,
         doc="""Compute the maximum of ``value`` and ``arr[i,j]``, atomically update the array, and return the old value.
 
     The operation is only atomic on a per-component basis for vectors and matrices.""",
@@ -4720,6 +4857,7 @@ for array_type in array_types:
         input_types={"arr": array_type(dtype=Any), "i": Int, "j": Int, "k": Int, "value": Any},
         constraint=atomic_op_constraint,
         value_func=atomic_op_value_func,
+        dispatch_func=atomic_op_dispatch_func,
         doc="""Compute the maximum of ``value`` and ``arr[i,j,k]``, atomically update the array, and return the old value.
 
     The operation is only atomic on a per-component basis for vectors and matrices.""",
@@ -4732,6 +4870,7 @@ for array_type in array_types:
         input_types={"arr": array_type(dtype=Any), "i": Int, "j": Int, "k": Int, "l": Int, "value": Any},
         constraint=atomic_op_constraint,
         value_func=atomic_op_value_func,
+        dispatch_func=atomic_op_dispatch_func,
         doc="""Compute the maximum of ``value`` and ``arr[i,j,k,l]``, atomically update the array, and return the old value.
 
     The operation is only atomic on a per-component basis for vectors and matrices.""",

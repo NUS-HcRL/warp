@@ -165,7 +165,9 @@ def add_example_test(
 
         # with wp.ScopedTimer(f"{name}_{sanitize_identifier(device)}"):
         # Run the script as a subprocess
-        result = subprocess.run(command, capture_output=True, text=True, env=env_vars, timeout=test_timeout)
+        result = subprocess.run(
+            command, capture_output=True, text=True, env=env_vars, timeout=test_timeout, check=False
+        )
 
         # Check the return code (0 is standard for success)
         test.assertEqual(
@@ -316,7 +318,7 @@ add_example_test(
     name="sim.example_cloth",
     devices=test_devices,
     test_options={"usd_required": True},
-    test_options_cpu={"num_frames": 10},
+    test_options_cpu={"num_frames": 10, "test_timeout": 600},
 )
 add_example_test(
     TestSimExamples, name="sim.example_granular", devices=test_devices, test_options_cpu={"num_frames": 10}
@@ -365,8 +367,14 @@ if check_p2p():
 add_example_test(
     TestFemExamples,
     name="fem.example_apic_fluid",
-    devices=get_selected_cuda_test_devices(),
+    devices=get_selected_cuda_test_devices(mode="basic"),
     test_options={"num_frames": 5, "voxel_size": 2.0},
+)
+add_example_test(
+    TestFemExamples,
+    name="fem.example_adaptive_grid",
+    devices=get_selected_cuda_test_devices(mode="basic"),
+    test_options={"headless": True, "div_conforming": True},
 )
 
 # The following examples do not need CUDA
@@ -390,18 +398,20 @@ add_example_test(
     name="fem.example_convection_diffusion",
     devices=test_devices,
     test_options={"resolution": 20, "headless": True},
+    test_options_cpu={"test_timeout": 600},
 )
 add_example_test(
     TestFemExamples,
     name="fem.example_burgers",
     devices=test_devices,
     test_options={"resolution": 20, "num_frames": 25, "degree": 1, "headless": True},
+    test_options_cpu={"test_timeout": 600},
 )
 add_example_test(
     TestFemExamples,
     name="fem.example_convection_diffusion_dg",
     devices=test_devices,
-    test_options={"resolution": 20, "num_frames": 25, "mesh": "quad", "headless": True},
+    test_options={"resolution": 20, "num_frames": 25, "headless": True},
     test_options_cpu={"test_timeout": 600},
 )
 add_example_test(

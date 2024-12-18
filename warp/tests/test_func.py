@@ -162,7 +162,7 @@ def user_func_with_defaults(a: int = 123, b: int = 234) -> int:
 
 
 @wp.kernel
-def test_user_func_with_defaults():
+def user_func_with_defaults_kernel():
     a = user_func_with_defaults()
     wp.expect_eq(a, 357)
 
@@ -177,6 +177,25 @@ def test_user_func_with_defaults():
 
     e = user_func_with_defaults(b=111)
     wp.expect_eq(e, 234)
+
+
+def test_user_func_with_defaults(test, device):
+    wp.launch(user_func_with_defaults_kernel, dim=1, device=device)
+
+    a = user_func_with_defaults()
+    assert a == 357
+
+    b = user_func_with_defaults(111)
+    assert b == 345
+
+    c = user_func_with_defaults(111, 222)
+    assert c == 333
+
+    d = user_func_with_defaults(a=111)
+    assert d == 345
+
+    e = user_func_with_defaults(b=111)
+    assert e == 234
 
 
 @wp.func
@@ -220,6 +239,16 @@ def test_user_func_overload_resolution(test, device):
 
     assert_np_equal(a0.numpy()[0], (4, 6, 8))
     assert a1.numpy()[0] == 12
+
+
+@wp.func
+def user_func_return_none() -> None:
+    pass
+
+
+@wp.kernel
+def test_return_annotation_none() -> None:
+    user_func_return_none()
 
 
 devices = get_test_devices()
@@ -396,9 +425,7 @@ add_function_test(TestFunc, func=test_func_closure_capture, name="test_func_clos
 add_function_test(TestFunc, func=test_multi_valued_func, name="test_multi_valued_func", devices=devices)
 add_kernel_test(TestFunc, kernel=test_func_defaults, name="test_func_defaults", dim=1, devices=devices)
 add_kernel_test(TestFunc, kernel=test_builtin_shadowing, name="test_builtin_shadowing", dim=1, devices=devices)
-add_kernel_test(
-    TestFunc, kernel=test_user_func_with_defaults, name="test_user_func_with_defaults", dim=1, devices=devices
-)
+add_function_test(TestFunc, func=test_user_func_with_defaults, name="test_user_func_with_defaults", devices=devices)
 add_kernel_test(
     TestFunc,
     kernel=test_user_func_return_multiple_values,
@@ -408,6 +435,9 @@ add_kernel_test(
 )
 add_function_test(
     TestFunc, func=test_user_func_overload_resolution, name="test_user_func_overload_resolution", devices=devices
+)
+add_kernel_test(
+    TestFunc, kernel=test_return_annotation_none, name="test_return_annotation_none", dim=1, devices=devices
 )
 
 

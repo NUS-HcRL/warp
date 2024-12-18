@@ -7,6 +7,7 @@
 
 import sys
 import unittest
+from typing import Tuple
 
 import warp as wp
 from warp.tests.unittest_utils import *
@@ -395,48 +396,29 @@ def test_unresolved_symbol(test, device):
 
 
 def test_error_global_var(test, device):
-    arr = wp.array(
-        (1.0, 2.0, 3.0),
-        dtype=float,
-        device=device,
-    )
+    arr = wp.array((1.0, 2.0, 3.0), dtype=float, device=device)
 
-    def kernel_1_fn(
-        out: wp.array(dtype=float),
-    ):
+    def kernel_1_fn(out: wp.array(dtype=float)):
         out[0] = arr[0]
 
-    def kernel_2_fn(
-        out: wp.array(dtype=float),
-    ):
+    def kernel_2_fn(out: wp.array(dtype=float)):
         out[0] = arr
 
-    def kernel_3_fn(
-        out: wp.array(dtype=float),
-    ):
+    def kernel_3_fn(out: wp.array(dtype=float)):
         out[0] = wp.lower_bound(arr, 2.0)
 
     out = wp.empty_like(arr)
 
     kernel = wp.Kernel(func=kernel_1_fn)
-    with test.assertRaisesRegex(
-        TypeError,
-        r"Invalid external reference type: <class 'warp.types.array'>",
-    ):
+    with test.assertRaisesRegex(TypeError, r"Invalid external reference type: <class 'warp.types.array'>"):
         wp.launch(kernel, dim=out.shape, inputs=(), outputs=(out,), device=device)
 
     kernel = wp.Kernel(func=kernel_2_fn)
-    with test.assertRaisesRegex(
-        TypeError,
-        r"Invalid external reference type: <class 'warp.types.array'>",
-    ):
+    with test.assertRaisesRegex(TypeError, r"Invalid external reference type: <class 'warp.types.array'>"):
         wp.launch(kernel, dim=out.shape, inputs=(), outputs=(out,), device=device)
 
     kernel = wp.Kernel(func=kernel_3_fn)
-    with test.assertRaisesRegex(
-        TypeError,
-        r"Invalid external reference type: <class 'warp.types.array'>",
-    ):
+    with test.assertRaisesRegex(TypeError, r"Invalid external reference type: <class 'warp.types.array'>"):
         wp.launch(kernel, dim=out.shape, inputs=(), outputs=(out,), device=device)
 
 
@@ -468,16 +450,12 @@ def test_error_collection_construct(test, device):
         wp.launch(kernel, dim=1, device=device)
 
     kernel = wp.Kernel(func=kernel_3_fn)
-    with test.assertRaisesRegex(
-        RuntimeError,
-        r"Construct `ast.Dict` not supported in kernels.",
-    ):
+    with test.assertRaisesRegex(RuntimeError, r"Construct `ast.Dict` not supported in kernels."):
         wp.launch(kernel, dim=1, device=device)
 
     kernel = wp.Kernel(func=kernel_4_fn)
     with test.assertRaisesRegex(
-        RuntimeError,
-        r"Tuple constructs are not supported in kernels. Use vectors like `wp.vec3\(\)` instead.",
+        RuntimeError, r"Tuple constructs are not supported in kernels. Use vectors like `wp.vec3\(\)` instead."
     ):
         wp.launch(kernel, dim=1, device=device)
 
@@ -490,10 +468,7 @@ def test_error_unmatched_arguments(test, device):
         x = wp.dot(wp.vec2(1.0, 2.0), wp.vec2h(wp.float16(1.0), wp.float16(2.0)))
 
     kernel = wp.Kernel(func=kernel_1_fn)
-    with test.assertRaisesRegex(
-        RuntimeError,
-        r"Input types must be the same, got \['int32', 'float32'\]",
-    ):
+    with test.assertRaisesRegex(RuntimeError, r"Input types must be the same, got \['int32', 'float32'\]"):
         wp.launch(kernel, dim=1, device=device)
 
     kernel = wp.Kernel(func=kernel_2_fn)
@@ -589,6 +564,64 @@ def test_error_mutating_constant_in_dynamic_loop(test, device):
     assert_np_equal(mats.numpy(), np.zeros((1, 3, 3)))
 
 
+def test_error_return_annotation_mismatch(test, device):
+    @wp.func
+    def foo_1(x: wp.int32) -> wp.int16:
+        return wp.int8(x)
+
+    def kernel_1_fn():
+        x = foo_1(123)
+
+    @wp.func
+    def foo_2(x: int) -> int:
+        return (x + x, x * x)
+
+    def kernel_2_fn():
+        x = foo_2(123)
+
+    @wp.func
+    def foo_3(x: int) -> Tuple[int, int]:
+        return (x, 1.23)
+
+    def kernel_3_fn():
+        x, y = foo_3(123)
+
+    @wp.func
+    def foo_4(x: int) -> Tuple[int, int, int]:
+        return (x + x, x * x)
+
+    def kernel_4_fn():
+        x, y, z = foo_4(123)
+
+    kernel = wp.Kernel(func=kernel_1_fn)
+    with test.assertRaisesRegex(
+        wp.codegen.WarpCodegenError,
+        r"The function `foo_1` has its return type annotated as `int16` but the code returns a value of type `int8`.",
+    ):
+        wp.launch(kernel, dim=1, device=device)
+
+    kernel = wp.Kernel(func=kernel_2_fn)
+    with test.assertRaisesRegex(
+        wp.codegen.WarpCodegenError,
+        r"The function `foo_2` has its return type annotated as `int` but the code returns 2 values.",
+    ):
+        wp.launch(kernel, dim=1, device=device)
+
+    kernel = wp.Kernel(func=kernel_3_fn)
+    with test.assertRaisesRegex(
+        wp.codegen.WarpCodegenError,
+        r"The function `foo_3` has its return type annotated as `Tuple\[int, int\]` but the code returns a tuple with types `\(int32, float32\)`.",
+    ):
+        wp.launch(kernel, dim=1, device=device)
+
+    kernel = wp.Kernel(func=kernel_4_fn)
+    with test.assertRaisesRegex(
+        wp.codegen.WarpCodegenError,
+        r"The function `foo_4` has its return type annotated as a tuple of 3 elements but the code returns 2 values.",
+    ):
+        wp.launch(kernel, dim=1, device=device)
+
+
 @wp.kernel
 def test_call_syntax():
     expected_pow = 16.0
@@ -645,12 +678,7 @@ add_kernel_test(
     TestCodeGen, name="test_dynamic_for_rename", kernel=test_dynamic_for_rename, inputs=[10], dim=1, devices=devices
 )
 add_kernel_test(
-    TestCodeGen,
-    name="test_dynamic_for_inplace",
-    kernel=test_dynamic_for_inplace,
-    inputs=[10],
-    dim=1,
-    devices=devices,
+    TestCodeGen, name="test_dynamic_for_inplace", kernel=test_dynamic_for_inplace, inputs=[10], dim=1, devices=devices
 )
 add_kernel_test(TestCodeGen, name="test_reassign", kernel=test_reassign, dim=1, devices=devices)
 add_kernel_test(
@@ -695,12 +723,7 @@ add_kernel_test(
 )
 
 add_kernel_test(
-    TestCodeGen,
-    name="test_range_static_sum",
-    kernel=test_range_static_sum,
-    dim=1,
-    expect=[10, 10, 10],
-    devices=devices,
+    TestCodeGen, name="test_range_static_sum", kernel=test_range_static_sum, dim=1, expect=[10, 10, 10], devices=devices
 )
 add_kernel_test(
     TestCodeGen,
@@ -730,20 +753,9 @@ add_kernel_test(
     devices=devices,
 )
 add_kernel_test(
-    TestCodeGen,
-    name="test_range_dynamic_nested",
-    kernel=test_range_dynamic_nested,
-    dim=1,
-    inputs=[4],
-    devices=devices,
+    TestCodeGen, name="test_range_dynamic_nested", kernel=test_range_dynamic_nested, dim=1, inputs=[4], devices=devices
 )
-add_kernel_test(
-    TestCodeGen,
-    name="test_range_expression",
-    kernel=test_range_expression,
-    dim=1,
-    devices=devices,
-)
+add_kernel_test(TestCodeGen, name="test_range_expression", kernel=test_range_expression, dim=1, devices=devices)
 
 add_kernel_test(TestCodeGen, name="test_while_zero", kernel=test_while, dim=1, inputs=[0], devices=devices)
 add_kernel_test(TestCodeGen, name="test_while_positive", kernel=test_while, dim=1, inputs=[16], devices=devices)
@@ -774,7 +786,12 @@ add_function_test(
     name="test_error_mutating_constant_in_dynamic_loop",
     devices=devices,
 )
-
+add_function_test(
+    TestCodeGen,
+    func=test_error_return_annotation_mismatch,
+    name="test_error_return_annotation_mismatch",
+    devices=devices,
+)
 add_kernel_test(TestCodeGen, name="test_call_syntax", kernel=test_call_syntax, dim=1, devices=devices)
 add_kernel_test(TestCodeGen, name="test_shadow_builtin", kernel=test_shadow_builtin, dim=1, devices=devices)
 add_kernel_test(TestCodeGen, name="test_while_condition_eval", kernel=test_while_condition_eval, dim=1, devices=devices)

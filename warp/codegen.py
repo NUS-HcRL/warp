@@ -114,6 +114,16 @@ def get_closure_cell_contents(obj):
     return None
 
 
+def get_type_origin(tp):
+    # Compatible version of `typing.get_origin()` for Python 3.7 and older.
+    return getattr(tp, "__origin__", None)
+
+
+def get_type_args(tp):
+    # Compatible version of `typing.get_args()` for Python 3.7 and older.
+    return getattr(tp, "__args__", ())
+
+
 def eval_annotations(annotations: Mapping[str, Any], obj: Any) -> Mapping[str, Any]:
     """Un-stringize annotations caused by `from __future__ import annotations` of PEP 563."""
     # Implementation backported from `inspect.get_annotations()` for Python 3.9 and older.
@@ -882,7 +892,7 @@ class Adjoint:
             # use source-level argument annotations
             if len(argspec.annotations) < len(argspec.args):
                 raise WarpCodegenError(f"Incomplete argument annotations on function {adj.fun_name}")
-            adj.arg_types = argspec.annotations
+            adj.arg_types = {k: v for k, v in argspec.annotations.items() if not (k == "return" and v is None)}
         else:
             # use overload argument annotations
             for arg_name in argspec.args:
@@ -922,6 +932,25 @@ class Adjoint:
 
         # Collect the LTOIR required at link-time
         adj.ltoirs = []
+
+    # allocate extra space for a function call that requires its
+    # own shared memory space, we treat shared memory as a stack
+    # where each function pushes and pops space off, the extra
+    # quantity is the 'roofline' amount required for the entire kernel
+    def alloc_shared_extra(adj, num_bytes):
+        adj.max_required_extra_shared_memory = max(adj.max_required_extra_shared_memory, num_bytes)
+
+    # returns the total number of bytes for a function
+    # based on it's own requirements + worst case
+    # requirements of any dependent functions
+    def get_total_required_shared(adj):
+        total_shared = 0
+
+        for var in adj.variables:
+            if is_tile(var.type) and var.type.storage == "shared":
+                total_shared += var.type.size_in_bytes()
+
+        return total_shared + adj.max_required_extra_shared_memory
 
     # generate function ssa form and adjoint
     def build(adj, builder, default_builder_options=None):
@@ -964,6 +993,9 @@ class Adjoint:
 
         # used to generate new label indices
         adj.label_count = 0
+
+        # tracks how much additional shared memory is required by any dependent function calls
+        adj.max_required_extra_shared_memory = 0
 
         # update symbol map for each argument
         for a in adj.args:
@@ -1143,25 +1175,25 @@ class Adjoint:
         left = adj.load(left)
         s = output.emit() + " = " + ("(" * len(comps)) + left.emit() + " "
 
-        prev_comp = None
+        prev_comp_var = None
 
         for op, comp in zip(op_strings, comps):
             comp_chainable = op_str_is_chainable(op)
-            if comp_chainable and prev_comp:
-                # We  restrict chaining to operands of the same type
-                if prev_comp.type is comp.type:
-                    prev_comp = adj.load(prev_comp)
-                    comp = adj.load(comp)
-                    s += "&& (" + prev_comp.emit() + " " + op + " " + comp.emit() + ")) "
+            if comp_chainable and prev_comp_var:
+                # We restrict chaining to operands of the same type
+                if prev_comp_var.type is comp.type:
+                    prev_comp_var = adj.load(prev_comp_var)
+                    comp_var = adj.load(comp)
+                    s += "&& (" + prev_comp_var.emit() + " " + op + " " + comp_var.emit() + ")) "
                 else:
                     raise WarpCodegenTypeError(
-                        f"Cannot chain comparisons of unequal types: {prev_comp.type} {op} {comp.type}."
+                        f"Cannot chain comparisons of unequal types: {prev_comp_var.type} {op} {comp.type}."
                     )
             else:
-                comp = adj.load(comp)
-                s += op + " " + comp.emit() + ") "
+                comp_var = adj.load(comp)
+                s += op + " " + comp_var.emit() + ") "
 
-            prev_comp = comp
+            prev_comp_var = comp_var
 
         s = s.rstrip() + ";"
 
@@ -1334,13 +1366,15 @@ class Adjoint:
         fwd_args = []
         for func_arg in func_args:
             if not isinstance(func_arg, (Reference, warp.context.Function)):
-                func_arg = adj.load(func_arg)
+                func_arg_var = adj.load(func_arg)
+            else:
+                func_arg_var = func_arg
 
             # if the argument is a function (and not a builtin), then build it recursively
-            if isinstance(func_arg, warp.context.Function) and not func_arg.is_builtin():
-                adj.builder.build_function(func_arg)
+            if isinstance(func_arg_var, warp.context.Function) and not func_arg_var.is_builtin():
+                adj.builder.build_function(func_arg_var)
 
-            fwd_args.append(strip_reference(func_arg))
+            fwd_args.append(strip_reference(func_arg_var))
 
         if return_type is None:
             # handles expression (zero output) functions, e.g.: void do_something();
@@ -1386,6 +1420,11 @@ class Adjoint:
             if arg_str is not None:
                 reverse_call = f"{func.namespace}adj_{func.native_func}({arg_str});"
                 adj.add_reverse(reverse_call)
+
+        # update our smem roofline requirements based on any
+        # shared memory required by the dependent function call
+        if not func.is_builtin():
+            adj.alloc_shared_extra(func.adj.get_total_required_shared())
 
         return output
 
@@ -1488,7 +1527,7 @@ class Adjoint:
         # zero adjoints
         for i in body_block.vars:
             if is_tile(i.type):
-                reverse.append(adj.indentation + f"\t{i.emit_adj()}.zero();")
+                reverse.append(adj.indentation + f"\t{i.emit_adj()}.grad_zero();")
             else:
                 reverse.append(adj.indentation + f"\t{i.emit_adj()} = {{}};")
 
@@ -1817,6 +1856,17 @@ class Adjoint:
     def emit_Ellipsis(adj, node):
         # stubbed @wp.native_func
         return
+
+    def emit_Assert(adj, node):
+        # eval condition
+        cond = adj.eval(node.test)
+        cond = adj.load(cond)
+
+        source_segment = ast.get_source_segment(adj.source, node)
+        # If a message was provided with the assert, " marks can interfere with the generated code
+        escaped_segment = source_segment.replace('"', '\\"')
+
+        adj.add_forward(f'assert(("{escaped_segment}",{cond.emit()}));')
 
     def emit_NameConstant(adj, node):
         if node.value:
@@ -2230,7 +2280,7 @@ class Adjoint:
 
     # returns the object being indexed, and the list of indices
     def eval_subscript(adj, node):
-        # We want to coalesce multi-dimentional array indexing into a single operation. This needs to deal with expressions like `a[i][j][x][y]` where `a` is a 2D array of matrices,
+        # We want to coalesce multi-dimensional array indexing into a single operation. This needs to deal with expressions like `a[i][j][x][y]` where `a` is a 2D array of matrices,
         # and essentially rewrite it into `a[i, j][x][y]`. Since the AST observes the indexing right-to-left, and we don't want to evaluate the index expressions prematurely,
         # this requires a first loop to check if this `node` only performs indexing on the array, and a second loop to evaluate and collect index variables.
         root = node
@@ -2532,8 +2582,10 @@ class Adjoint:
             adj.return_var = ()
             for ret in var:
                 if is_reference(ret.type):
-                    ret = adj.add_builtin_call("copy", [ret])
-                adj.return_var += (ret,)
+                    ret_var = adj.add_builtin_call("copy", [ret])
+                else:
+                    ret_var = ret
+                adj.return_var += (ret_var,)
 
         adj.add_return(adj.return_var)
 
@@ -2559,10 +2611,21 @@ class Adjoint:
             target_type = strip_reference(target.type)
 
             if is_array(target_type):
-                # target_type is not suitable for atomic array accumulation
-                if target_type.dtype not in warp.types.atomic_types:
+                # target_types int8, uint8, int16, uint16 are not suitable for atomic array accumulation
+                if target_type.dtype in warp.types.non_atomic_types:
                     make_new_assign_statement()
                     return
+
+                # the same holds true for vecs/mats/quats that are composed of these types
+                if (
+                    type_is_vector(target_type.dtype)
+                    or type_is_quaternion(target_type.dtype)
+                    or type_is_matrix(target_type.dtype)
+                ):
+                    dtype = getattr(target_type.dtype, "_wp_scalar_type_", None)
+                    if dtype in warp.types.non_atomic_types:
+                        make_new_assign_statement()
+                        return
 
                 kernel_name = adj.fun_name
                 filename = adj.filename
@@ -2636,6 +2699,7 @@ class Adjoint:
         ast.Tuple: emit_Tuple,
         ast.Pass: emit_Pass,
         ast.Ellipsis: emit_Ellipsis,
+        ast.Assert: emit_Assert,
     }
 
     def eval(adj, node):
@@ -3096,6 +3160,9 @@ extern "C" __global__ void {name}_cuda_kernel_forward(
          _idx < dim.size;
          _idx += static_cast<size_t>(blockDim.x) * static_cast<size_t>(gridDim.x))
     {{
+        // reset shared memory allocator
+        wp::tile_alloc_shared(0, true);
+
 {forward_body}    }}
 }}
 
@@ -3106,6 +3173,9 @@ extern "C" __global__ void {name}_cuda_kernel_backward(
          _idx < dim.size;
          _idx += static_cast<size_t>(blockDim.x) * static_cast<size_t>(gridDim.x))
     {{
+        // reset shared memory allocator
+        wp::tile_alloc_shared(0, true);
+
 {reverse_body}    }}
 }}
 
@@ -3344,7 +3414,7 @@ def codegen_func_forward(adj, func_type="kernel", device="cpu"):
 
     for var in adj.variables:
         if is_tile(var.type):
-            lines += [f"{var.ctype()} {var.emit()} = {var.type.cinit()};\n"]
+            lines += [f"{var.ctype()} {var.emit()} = {var.type.cinit(requires_grad=False)};\n"]
         elif var.constant is None:
             lines += [f"{var.ctype()} {var.emit()};\n"]
         else:
@@ -3381,7 +3451,7 @@ def codegen_func_reverse(adj, func_type="kernel", device="cpu"):
 
     for var in adj.variables:
         if is_tile(var.type):
-            lines += [f"{var.ctype()} {var.emit()} = {var.type.cinit()};\n"]
+            lines += [f"{var.ctype()} {var.emit()} = {var.type.cinit(requires_grad=True)};\n"]
         elif var.constant is None:
             lines += [f"{var.ctype()} {var.emit()};\n"]
         else:
@@ -3396,7 +3466,14 @@ def codegen_func_reverse(adj, func_type="kernel", device="cpu"):
         ctype = var.ctype(value_type=True)
 
         if is_tile(var.type):
-            lines += [f"{ctype} {name} = {var.type.cinit(adjoint=True)};\n"]
+            if var.type.storage == "register":
+                lines += [
+                    f"{var.type.ctype()} {name}(0.0);\n"
+                ]  # reverse mode tiles alias the forward vars since shared tiles store both primal/dual vars together
+            elif var.type.storage == "shared":
+                lines += [
+                    f"{var.type.ctype()}& {name} = {var.emit()};\n"
+                ]  # reverse mode tiles alias the forward vars since shared tiles store both primal/dual vars together
         else:
             lines += [f"{ctype} {name} = {{}};\n"]
 
@@ -3426,6 +3503,33 @@ def codegen_func_reverse(adj, func_type="kernel", device="cpu"):
 def codegen_func(adj, c_func_name: str, device="cpu", options=None):
     if options is None:
         options = {}
+
+    if adj.return_var is not None and "return" in adj.arg_types:
+        if get_type_origin(adj.arg_types["return"]) is tuple:
+            if len(get_type_args(adj.arg_types["return"])) != len(adj.return_var):
+                raise WarpCodegenError(
+                    f"The function `{adj.fun_name}` has its return type "
+                    f"annotated as a tuple of {len(get_type_args(adj.arg_types['return']))} elements "
+                    f"but the code returns {len(adj.return_var)} values."
+                )
+            elif not types_equal(adj.arg_types["return"], tuple(x.type for x in adj.return_var)):
+                raise WarpCodegenError(
+                    f"The function `{adj.fun_name}` has its return type "
+                    f"annotated as `{warp.context.type_str(adj.arg_types['return'])}` "
+                    f"but the code returns a tuple with types `({', '.join(warp.context.type_str(x.type) for x in adj.return_var)})`."
+                )
+        elif len(adj.return_var) > 1 and get_type_origin(adj.arg_types["return"]) is not tuple:
+            raise WarpCodegenError(
+                f"The function `{adj.fun_name}` has its return type "
+                f"annotated as `{warp.context.type_str(adj.arg_types['return'])}` "
+                f"but the code returns {len(adj.return_var)} values."
+            )
+        elif not types_equal(adj.arg_types["return"], adj.return_var[0].type):
+            raise WarpCodegenError(
+                f"The function `{adj.fun_name}` has its return type "
+                f"annotated as `{warp.context.type_str(adj.arg_types['return'])}` "
+                f"but the code returns a value of type `{warp.context.type_str(adj.return_var[0].type)}`."
+            )
 
     # forward header
     if adj.return_var is not None and len(adj.return_var) == 1:

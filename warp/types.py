@@ -12,9 +12,10 @@ import ctypes
 import inspect
 import struct
 import zlib
-from typing import Any, Callable, Generic, List, NamedTuple, Optional, Sequence, Tuple, TypeVar, Union
+from typing import Any, Callable, Generic, List, Literal, NamedTuple, Optional, Sequence, Tuple, TypeVar, Union
 
 import numpy as np
+import numpy.typing as npt
 
 import warp
 
@@ -342,8 +343,8 @@ def matrix(shape, dtype):
                             f"Invalid argument in matrix constructor, expected row of length {self._shape_[1]}, got {row}"
                         )
                     offset = i * self._shape_[1]
-                    for i in range(self._shape_[1]):
-                        super().__setitem__(offset + i, mat_t.scalar_import(row[i]))
+                    for j in range(self._shape_[1]):
+                        super().__setitem__(offset + j, mat_t.scalar_import(row[j]))
             else:
                 raise ValueError(
                     f"Invalid number of arguments in matrix constructor, expected {self._length_} elements, got {num_args}"
@@ -995,43 +996,6 @@ vector_types = (
     spatial_matrixd,
 )
 
-atomic_vector_types = (
-    vec2i,
-    vec2ui,
-    vec2l,
-    vec2ul,
-    vec2h,
-    vec2f,
-    vec2d,
-    vec3i,
-    vec3ui,
-    vec3l,
-    vec3ul,
-    vec3h,
-    vec3f,
-    vec3d,
-    vec4i,
-    vec4ui,
-    vec4l,
-    vec4ul,
-    vec4h,
-    vec4f,
-    vec4d,
-    mat22h,
-    mat22f,
-    mat22d,
-    mat33h,
-    mat33f,
-    mat33d,
-    mat44h,
-    mat44f,
-    mat44d,
-    quath,
-    quatf,
-    quatd,
-)
-atomic_types = float_types + (int32, uint32, int64, uint64) + atomic_vector_types
-
 np_dtype_to_warp_type = {
     # Numpy scalar types
     np.bool_: bool,
@@ -1079,6 +1043,14 @@ warp_type_to_np_dtype = {
     float32: np.float32,
     float64: np.float64,
 }
+
+non_atomic_types = (
+    int8,
+    uint8,
+    int16,
+    uint16,
+    int64,
+)
 
 
 def dtype_from_numpy(numpy_dtype):
@@ -1454,6 +1426,8 @@ def scalars_equal(a, b, match_generic):
 
 def types_equal(a, b, match_generic=False):
     if match_generic:
+        # Special cases to interpret the types listed in `int_tuple_type_hints`
+        # as generic hints that accept any integer types.
         if a in int_tuple_type_hints and isinstance(b, Sequence):
             a_length = int_tuple_type_hints[a]
             if (a_length == -1 or a_length == len(b)) and all(
@@ -1471,6 +1445,24 @@ def types_equal(a, b, match_generic=False):
             b_length = int_tuple_type_hints[b]
             if a_length is None or b_length is None or a_length == b_length:
                 return True
+
+    a_origin = warp.codegen.get_type_origin(a)
+    b_origin = warp.codegen.get_type_origin(b)
+    if a_origin is tuple and b_origin is tuple:
+        a_args = warp.codegen.get_type_args(a)
+        b_args = warp.codegen.get_type_args(b)
+        if len(a_args) == len(b_args) and all(
+            scalars_equal(x, y, match_generic=match_generic) for x, y in zip(a_args, b_args)
+        ):
+            return True
+    elif a_origin is tuple and isinstance(b, Sequence):
+        a_args = warp.codegen.get_type_args(a)
+        if len(a_args) == len(b) and all(scalars_equal(x, y, match_generic=match_generic) for x, y in zip(a_args, b)):
+            return True
+    elif b_origin is tuple and isinstance(a, Sequence):
+        b_args = warp.codegen.get_type_args(b)
+        if len(b_args) == len(a) and all(scalars_equal(x, y, match_generic=match_generic) for x, y in zip(b_args, a)):
+            return True
 
     # convert to canonical types
     if a == float:
@@ -1590,6 +1582,23 @@ def array_ctype_from_interface(interface: dict, dtype=None, owner=None):
 
 
 class array(Array):
+    """A fixed-size multi-dimensional array containing values of the same type.
+
+    Attributes:
+        dtype (DType): The data type of the array.
+        ndim (int): The number of array dimensions.
+        size (int): The number of items in the array.
+        capacity (int): The amount of memory in bytes allocated for this array.
+        shape (Tuple[int]): Dimensions of the array.
+        strides (Tuple[int]): Number of bytes in each dimension between successive elements of the array.
+        ptr (int): Pointer to underlying memory allocation backing the array.
+        device (Device): The device where the array's memory allocation resides.
+        pinned (bool): Indicates whether the array was allocated in pinned host memory.
+        is_contiguous (bool): Indicates whether this array has a contiguous memory layout.
+        deleter (Callable[[int, int], None]): A function to be called when the array is deleted,
+            taking two arguments: pointer and size. If ``None``, then no function is called.
+    """
+
     # member attributes available during code-gen (e.g.: d = array.shape[0])
     # (initialized when needed)
     _vars = None
@@ -1601,21 +1610,21 @@ class array(Array):
 
     def __init__(
         self,
-        data=None,
-        dtype: DType = Any,
-        shape=None,
-        strides=None,
-        length=None,
-        ptr=None,
-        capacity=None,
+        data: Optional[Union[List, Tuple, npt.NDArray]] = None,
+        dtype: Union[DType, Any] = Any,
+        shape: Optional[Tuple[int, ...]] = None,
+        strides: Optional[Tuple[int, ...]] = None,
+        length: Optional[int] = None,
+        ptr: Optional[int] = None,
+        capacity: Optional[int] = None,
         device=None,
-        pinned=False,
-        copy=True,
-        owner=False,  # deprecated - pass deleter instead
-        deleter=None,
-        ndim=None,
-        grad=None,
-        requires_grad=False,
+        pinned: bool = False,
+        copy: bool = True,
+        owner: bool = False,  # deprecated - pass deleter instead
+        deleter: Optional[Callable[[int, int], None]] = None,
+        ndim: Optional[int] = None,
+        grad: Optional[array] = None,
+        requires_grad: bool = False,
     ):
         """Constructs a new Warp array object
 
@@ -1637,20 +1646,24 @@ class array(Array):
         are taken into account and no memory is allocated for the array.
 
         Args:
-            data (Union[list, tuple, ndarray]): An object to construct the array from, can be a Tuple, List, or generally any type convertible to an np.array
-            dtype (Union): One of the available `data types <#data-types>`_, such as :class:`warp.float32`, :class:`warp.mat33`, or a custom `struct <#structs>`_. If dtype is ``Any`` and data is an ndarray, then it will be inferred from the array data type
-            shape (tuple): Dimensions of the array
-            strides (tuple): Number of bytes in each dimension between successive elements of the array
-            length (int): Number of elements of the data type (deprecated, users should use `shape` argument)
-            ptr (uint64): Address of an external memory address to alias (data should be None)
-            capacity (int): Maximum size in bytes of the ptr allocation (data should be None)
+            data: An object to construct the array from, can be a Tuple, List, or generally any type convertible to an np.array
+            dtype: One of the available `data types <#data-types>`_, such as :class:`warp.float32`, :class:`warp.mat33`, or a custom `struct <#structs>`_. If dtype is ``Any`` and data is an ndarray, then it will be inferred from the array data type
+            shape: Dimensions of the array
+            strides: Number of bytes in each dimension between successive elements of the array
+            length: Number of elements of the data type (deprecated, users should use ``shape`` argument)
+            ptr: Address of an external memory address to alias (``data`` should be ``None``)
+            capacity: Maximum size in bytes of the ``ptr`` allocation (``data`` should be ``None``)
             device (Devicelike): Device the array lives on
-            copy (bool): Whether the incoming data will be copied or aliased, this is only possible when the incoming `data` already lives on the device specified and types match
-            owner (bool): Should the array object try to deallocate memory when it is deleted (deprecated, pass `deleter` if you wish to transfer ownership to Warp)
-            deleter (Callable): Function to be called when deallocating the array, taking two arguments, pointer and size
-            requires_grad (bool): Whether or not gradients will be tracked for this array, see :class:`warp.Tape` for details
-            grad (array): The gradient array to use
-            pinned (bool): Whether to allocate pinned host memory, which allows asynchronous host-device transfers (only applicable with device="cpu")
+            copy: Whether the incoming ``data`` will be copied or aliased. Aliasing requires that
+                the incoming ``data`` already lives on the ``device`` specified and the data types match.
+            owner: Whether the array will try to deallocate the underlying memory when it is deleted
+                (deprecated, pass ``deleter`` if you wish to transfer ownership to Warp)
+            deleter: Function to be called when the array is deleted, taking two arguments: pointer and size
+            requires_grad: Whether or not gradients will be tracked for this array, see :class:`warp.Tape` for details
+            grad: The array in which to accumulate gradients in the backward pass. If ``None`` and ``requires_grad`` is ``True``,
+                then a gradient array will be allocated automatically.
+            pinned: Whether to allocate pinned host memory, which allows asynchronous host–device transfers
+                (only applicable with ``device="cpu"``)
 
         """
 
@@ -2974,9 +2987,9 @@ def array_type_id(a):
 
 # tile expression objects
 class Tile:
-    allocation = 0
+    alignment = 16
 
-    def __init__(self, dtype, M, N, op=None, storage="register", layout="rowmajor", owner=True):
+    def __init__(self, dtype, M, N, op=None, storage="register", layout="rowmajor", strides=None, owner=True):
         self.dtype = type_to_warp(dtype)
         self.M = M
         self.N = N
@@ -2984,11 +2997,13 @@ class Tile:
         self.storage = storage
         self.layout = layout
 
-        # default to row major layout
-        if layout == "rowmajor":
-            self.strides = (N, 1)
-        elif layout == "colmajor":
-            self.strides = (1, M)
+        if strides is None:
+            if layout == "rowmajor":
+                self.strides = (N, 1)
+            elif layout == "colmajor":
+                self.strides = (1, M)
+        else:
+            self.strides = strides
 
         self.owner = owner
 
@@ -2999,37 +3014,32 @@ class Tile:
         if self.storage == "register":
             return f"wp::tile_register_t<{Var.type_to_ctype(self.dtype)},{self.M},{self.N}>"
         elif self.storage == "shared":
-            return f"wp::tile_shared_t<{Var.type_to_ctype(self.dtype)},{self.M},{self.N},{self.strides[0]}, {self.strides[1]}>"
+            return f"wp::tile_shared_t<{Var.type_to_ctype(self.dtype)},{self.M},{self.N},{self.strides[0]}, {self.strides[1]}, {'true' if self.owner else 'false'}>"
         else:
             raise RuntimeError(f"Unrecognized tile storage type {self.storage}")
 
     # generates C-initializer string
-    def cinit(self, adjoint=False):
+    def cinit(self, requires_grad=False):
         from warp.codegen import Var
 
         if self.storage == "register":
             return self.ctype() + "(0.0)"
         elif self.storage == "shared":
-            # if this is a reference to another tile
-            # then don't allocate any memory
-
-            if adjoint:
-                # backward pass requires zeroed memory
-                return f"wp::tile_alloc_zeros<{Var.type_to_ctype(self.dtype)},{self.M},{self.N},{self.strides[0]}, {self.strides[1]}, {Tile.alloc()}>()"
+            if self.owner:
+                # allocate new shared memory tile
+                return f"wp::tile_alloc_empty<{Var.type_to_ctype(self.dtype)},{self.M},{self.N},{'true' if requires_grad else 'false'}>()"
             else:
-                if not self.owner:
-                    # will be initialized by subsequent call, e.g.: t = tile_broadcast(a)
-                    return "NULL"
-                else:
-                    # forward mode can be uninitialized until first used by the kernel
-                    return f"wp::tile_alloc_empty<{Var.type_to_ctype(self.dtype)},{self.M},{self.N},{Tile.alloc()}>()"
+                # tile will be initialized by another call, e.g.: tile_transpose()
+                return "NULL"
 
-    # generate a unique allocation index for shared memory
-    @classmethod
-    def alloc(cls):
-        index = Tile.allocation
-        Tile.allocation += 1
-        return index
+    # return total tile size in bytes
+    def size_in_bytes(self):
+        num_bytes = self.align(type_size_in_bytes(self.dtype) * self.M * self.N)
+        return num_bytes
+
+    # align tile size to natural boundary, default 16-bytes
+    def align(self, bytes):
+        return ((bytes + self.alignment - 1) // self.alignment) * self.alignment
 
 
 class TileZeros(Tile):
@@ -3666,9 +3676,9 @@ class Volume:
             grid_data = bytearray()
             while grid_data_offset < file_end:
                 chunk_size = struct.unpack("<Q", data[grid_data_offset : grid_data_offset + 8])[0]
-                grid_data += zlib.decompress(data[grid_data_offset + 8 :])
-                grid_data_offset += 8 + chunk_size
-
+                grid_data_offset += 8
+                grid_data += zlib.decompress(data[grid_data_offset : grid_data_offset + chunk_size])
+                grid_data_offset += chunk_size
         elif codec == 2:  # blosc compression
             try:
                 import blosc
@@ -3680,8 +3690,9 @@ class Volume:
             grid_data = bytearray()
             while grid_data_offset < file_end:
                 chunk_size = struct.unpack("<Q", data[grid_data_offset : grid_data_offset + 8])[0]
-                grid_data += blosc.decompress(data[grid_data_offset + 8 :])
-                grid_data_offset += 8 + chunk_size
+                grid_data_offset += 8
+                grid_data += blosc.decompress(data[grid_data_offset : grid_data_offset + chunk_size])
+                grid_data_offset += chunk_size
         else:
             raise RuntimeError(f"Unsupported codec code: {codec}")
 
@@ -3691,6 +3702,139 @@ class Volume:
 
         data_array = array(np.frombuffer(grid_data, dtype=np.byte), device=device)
         return cls(data_array)
+
+    def save_to_nvdb(self, path, codec: Literal["none", "zip", "blosc"] = "none"):
+        """Serialize the Volume into a NanoVDB (.nvdb) file.
+
+        Args:
+            path: File path to save.
+            codec: Compression codec used
+                "none" - no compression
+                "zip" - ZIP compression
+                "blosc" - BLOSC compression, requires the blosc module to be installed
+        """
+
+        codec_dict = {"none": 0, "zip": 1, "blosc": 2}
+
+        class FileHeader(ctypes.Structure):
+            _fields_ = [
+                ("magic", ctypes.c_uint64),
+                ("version", ctypes.c_uint32),
+                ("gridCount", ctypes.c_uint16),
+                ("codec", ctypes.c_uint16),
+            ]
+
+        class FileMetaData(ctypes.Structure):
+            _fields_ = [
+                ("gridSize", ctypes.c_uint64),
+                ("fileSize", ctypes.c_uint64),
+                ("nameKey", ctypes.c_uint64),
+                ("voxelCount", ctypes.c_uint64),
+                ("gridType", ctypes.c_uint32),
+                ("gridClass", ctypes.c_uint32),
+                ("worldBBox", ctypes.c_double * 6),
+                ("indexBBox", ctypes.c_uint32 * 6),
+                ("voxelSize", ctypes.c_double * 3),
+                ("nameSize", ctypes.c_uint32),
+                ("nodeCount", ctypes.c_uint32 * 4),
+                ("tileCount", ctypes.c_uint32 * 3),
+                ("codec", ctypes.c_uint16),
+                ("padding", ctypes.c_uint16),
+                ("version", ctypes.c_uint32),
+            ]
+
+        class GridData(ctypes.Structure):
+            _fields_ = [
+                ("magic", ctypes.c_uint64),
+                ("checksum", ctypes.c_uint64),
+                ("version", ctypes.c_uint32),
+                ("flags", ctypes.c_uint32),
+                ("gridIndex", ctypes.c_uint32),
+                ("gridCount", ctypes.c_uint32),
+                ("gridSize", ctypes.c_uint64),
+                ("gridName", ctypes.c_char * 256),
+                ("map", ctypes.c_byte * 264),
+                ("worldBBox", ctypes.c_double * 6),
+                ("voxelSize", ctypes.c_double * 3),
+                ("gridClass", ctypes.c_uint32),
+                ("gridType", ctypes.c_uint32),
+                ("blindMetadataOffset", ctypes.c_int64),
+                ("blindMetadataCount", ctypes.c_uint32),
+                ("data0", ctypes.c_uint32),
+                ("data1", ctypes.c_uint64),
+                ("data2", ctypes.c_uint64),
+            ]
+
+        NVDB_MAGIC = 0x304244566F6E614E
+        NVDB_VERSION = 32 << 21 | 3 << 10 | 3
+
+        try:
+            codec_int = codec_dict[codec]
+        except KeyError as err:
+            raise RuntimeError(f"Unsupported codec requested: {codec}") from err
+
+        if codec_int == 2:
+            try:
+                import blosc
+            except ImportError as err:
+                raise RuntimeError(
+                    f"blosc compression was requested, but Python module could not be imported: {err}"
+                ) from err
+
+        data = self.array().numpy()
+        grid_data = GridData.from_buffer(data)
+
+        if grid_data.gridIndex > 0:
+            raise RuntimeError(
+                "Saving of aliased Volumes is not supported. Use `save_to_nvdb` on the original volume, before any `load_next_grid` calls."
+            )
+
+        file_header = FileHeader(NVDB_MAGIC, NVDB_VERSION, grid_data.gridCount, codec_int)
+
+        grid_data_offset = 0
+        all_file_meta_data = []
+        for i in range(file_header.gridCount):
+            if i > 0:
+                grid_data = GridData.from_buffer(data[grid_data_offset : grid_data_offset + 672])
+            current_grid_data = data[grid_data_offset : grid_data_offset + grid_data.gridSize]
+            if codec_int == 1:  # zip compression
+                compressed_data = zlib.compress(current_grid_data)
+                compressed_size = len(compressed_data)
+            elif codec_int == 2:  # blosc compression
+                compressed_data = blosc.compress(current_grid_data)
+                compressed_size = len(compressed_data)
+            else:  # no compression
+                compressed_data = current_grid_data
+                compressed_size = grid_data.gridSize
+
+            file_meta_data = FileMetaData()
+            file_meta_data.gridSize = grid_data.gridSize
+            file_meta_data.fileSize = compressed_size
+            file_meta_data.gridType = grid_data.gridType
+            file_meta_data.gridClass = grid_data.gridClass
+            file_meta_data.worldBBox = grid_data.worldBBox
+            file_meta_data.voxelSize = grid_data.voxelSize
+            file_meta_data.nameSize = len(grid_data.gridName) + 1  # including the closing 0x0
+            file_meta_data.codec = codec_int
+            file_meta_data.version = NVDB_VERSION
+
+            grid_data_offset += file_meta_data.gridSize
+
+            all_file_meta_data.append((file_meta_data, grid_data.gridName, compressed_data))
+
+        with open(path, "wb") as nvdb:
+            nvdb.write(file_header)
+            for file_meta_data, grid_name, _ in all_file_meta_data:
+                nvdb.write(file_meta_data)
+                nvdb.write(grid_name + b"\x00")
+
+            for file_meta_data, _, compressed_data in all_file_meta_data:
+                if codec_int > 0:
+                    chunk_size = struct.pack("<Q", file_meta_data.fileSize)
+                    nvdb.write(chunk_size)
+                nvdb.write(compressed_data)
+
+        return path
 
     @classmethod
     def load_from_address(cls, grid_ptr: int, buffer_size: int = 0, device=None) -> Volume:

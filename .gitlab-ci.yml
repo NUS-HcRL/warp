@@ -46,7 +46,6 @@ variables:
       - "3.10.13+nv3"
       - "3.9.18+nv1"
       - "3.8.18+nv1"
-      - "3.7.17+nv1"
     description: "The default Python version used in the main testing jobs."
 
 stages:
@@ -153,7 +152,7 @@ ruff lint:
     - .runner-utility-linux-x86_64
   before_script:
     - python -m pip install --upgrade pip
-    - pip install --upgrade ruff==0.6.8
+    - pip install ruff --constraint docs/requirements.txt
   script:
     - ruff check --output-format full  --exit-zero # Just to get something in the log
     - ruff check --output-format gitlab > gl-code-quality-report.json
@@ -169,7 +168,7 @@ ruff format:
     - .runner-utility-linux-x86_64
   before_script:
     - python -m pip install --upgrade pip
-    - pip install --upgrade ruff==0.6.8
+    - pip install ruff --constraint docs/requirements.txt
   script:
     - ruff format --diff
 
@@ -270,7 +269,7 @@ linux-x86_64 test:
     - $PYTHON -m venv _venv
     - source _venv/bin/activate
     - python -m pip install --upgrade pip
-    - python -m pip install --upgrade usd-core coverage[toml]
+    - python -m pip install --upgrade usd-core coverage[toml] blosc
     - python -m pip install --upgrade torch --extra-index-url https://download.pytorch.org/whl/cu121
     - python -m pip install -U "jax[cuda12]"
     - python -m pip install -e .
@@ -296,7 +295,7 @@ windows-x86_64 test:
     - '& $env:CI_PROJECT_DIR\_build\target-deps\python\python.exe -m venv _venv'
     - .\_venv\Scripts\Activate.ps1
     - python -m pip install --upgrade pip
-    - python -m pip install --upgrade usd-core coverage[toml] numpy
+    - python -m pip install --upgrade usd-core coverage[toml] numpy blosc
     - python -m pip install --upgrade torch --extra-index-url https://download.pytorch.org/whl/cu121
     - python -m pip install -e .
     - Write-Output "$([char]27)[0Ksection_end:$(GetTime):install_dependencies$([char]13)$([char]27)[0K"
@@ -455,6 +454,26 @@ windows-x86_64 docs:
   after_script:
     - echo "View the website at https://$CI_PROJECT_ROOT_NAMESPACE.$CI_PAGES_DOMAIN/-/$CI_PROJECT_NAME/-/jobs/$CI_JOB_ID/artifacts/public/index.html"
 
+# This job tests code snippets in the documentation
+doctest:
+  stage: test
+  image: python:3.11-slim
+  needs: [linux-x86_64 build]
+  extends:
+    - .omni_nvks_gpu
+  before_script:
+    - echo -e "\\e[0Ksection_start:`date +%s`:install_dependencies[collapsed=true]\\r\\e[0KSet up docs environment"
+    - df -h
+    - apt-get update && apt-get install make --no-install-recommends -y
+    # Move compiled binaries out of platform-specific directory
+    - mv warp/bin/linux-x86_64/warp.so warp/bin/
+    - mv warp/bin/linux-x86_64/warp-clang.so warp/bin/
+    - python -m pip install --upgrade pip
+    - python -m pip install -r docs/requirements.txt
+    - echo -e "\\e[0Ksection_end:`date +%s`:install_dependencies\\r\\e[0K"
+  script:
+    - sphinx-build -b doctest docs docs/_build/doctest
+
 # ==============================================================================
 # Child pipelines
 #
@@ -480,17 +499,6 @@ trigger python 3.X test pipelines:
     GIT_STRATEGY: none
   script:
     - echo "Run this job to test additional Python versions."
-
-
-python 3.7 test:
-  stage: child pipelines
-  needs: [trigger python 3.X test pipelines]
-  trigger:
-    include: /.gitlab/ci/additional-tests.yml
-  extends:
-    - .trigger_common
-  variables:
-    DEFAULT_PYTHON: "3.7.17+nv1"
 
 python 3.8 test:
   stage: child pipelines

@@ -12,6 +12,7 @@ import hashlib
 import inspect
 import io
 import itertools
+import json
 import operator
 import os
 import platform
@@ -21,7 +22,7 @@ import typing
 import weakref
 from copy import copy as shallowcopy
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
@@ -237,24 +238,23 @@ class Function:
         # in a way that is compatible with Python's semantics.
         signature_params = []
         signature_default_param_kind = inspect.Parameter.POSITIONAL_OR_KEYWORD
-        for param_name in self.input_types.keys():
-            if param_name.startswith("**"):
-                param_name = param_name[2:]
+        for raw_param_name in self.input_types.keys():
+            if raw_param_name.startswith("**"):
+                param_name = raw_param_name[2:]
                 param_kind = inspect.Parameter.VAR_KEYWORD
-            elif param_name.startswith("*"):
-                param_name = param_name[1:]
+            elif raw_param_name.startswith("*"):
+                param_name = raw_param_name[1:]
                 param_kind = inspect.Parameter.VAR_POSITIONAL
 
                 # Once a variadic argument like `*args` is found, any following
                 # arguments need to be passed using keywords.
                 signature_default_param_kind = inspect.Parameter.KEYWORD_ONLY
             else:
+                param_name = raw_param_name
                 param_kind = signature_default_param_kind
 
-            param = param = inspect.Parameter(
-                param_name,
-                param_kind,
-                default=self.defaults.get(param_name, inspect.Parameter.empty),
+            param = inspect.Parameter(
+                param_name, param_kind, default=self.defaults.get(param_name, inspect.Parameter.empty)
             )
             signature_params.append(param)
         self.signature = inspect.Signature(signature_params)
@@ -293,22 +293,22 @@ class Function:
 
         if hasattr(self, "user_overloads") and len(self.user_overloads):
             # user-defined function with overloads
+            bound_args = self.signature.bind(*args, **kwargs)
+            if self.defaults:
+                warp.codegen.apply_defaults(bound_args, self.defaults)
 
-            if len(kwargs):
-                raise RuntimeError(
-                    f"Error calling function '{self.key}', keyword arguments are not supported for user-defined overloads."
-                )
+            arguments = tuple(bound_args.arguments.values())
 
             # try and find a matching overload
             for overload in self.user_overloads.values():
-                if len(overload.input_types) != len(args):
+                if len(overload.input_types) != len(arguments):
                     continue
                 template_types = list(overload.input_types.values())
                 arg_names = list(overload.input_types.keys())
                 try:
                     # attempt to unify argument types with function template types
-                    warp.types.infer_argument_types(args, template_types, arg_names)
-                    return overload.func(*args)
+                    warp.types.infer_argument_types(arguments, template_types, arg_names)
+                    return overload.func(*arguments)
                 except Exception:
                     continue
 
@@ -508,11 +508,10 @@ def call_builtin(func: Function, *params) -> Tuple[bool, Any]:
                 if elem_count != arg_type._length_:
                     return (False, None)
 
-                # Retrieve the element type of the sequence while ensuring
-                # that it's homogeneous.
+                # Retrieve the element type of the sequence while ensuring that it's homogeneous.
                 elem_type = type(arr[0])
-                for i in range(1, elem_count):
-                    if type(arr[i]) is not elem_type:
+                for array_index in range(1, elem_count):
+                    if type(arr[array_index]) is not elem_type:
                         raise ValueError("All array elements must share the same type.")
 
                 expected_elem_type = arg_type._wp_scalar_type_
@@ -542,10 +541,10 @@ def call_builtin(func: Function, *params) -> Tuple[bool, Any]:
                 c_param = arg_type()
                 if warp.types.type_is_matrix(arg_type):
                     rows, cols = arg_type._shape_
-                    for i in range(rows):
-                        idx_start = i * cols
+                    for row_index in range(rows):
+                        idx_start = row_index * cols
                         idx_end = idx_start + cols
-                        c_param[i] = arr[idx_start:idx_end]
+                        c_param[row_index] = arr[idx_start:idx_end]
                 else:
                     c_param[:] = arr
 
@@ -621,9 +620,12 @@ def call_builtin(func: Function, *params) -> Tuple[bool, Any]:
 
 
 class KernelHooks:
-    def __init__(self, forward, backward):
+    def __init__(self, forward, backward, forward_smem_bytes=0, backward_smem_bytes=0):
         self.forward = forward
         self.backward = backward
+
+        self.forward_smem_bytes = forward_smem_bytes
+        self.backward_smem_bytes = backward_smem_bytes
 
 
 # caches source and compiled entry points for a kernel (will be populated after module loads)
@@ -972,8 +974,17 @@ def struct(c):
     return s
 
 
-# overload a kernel with the given argument types
-def overload(kernel, arg_types=None):
+def overload(kernel, arg_types=Union[None, Dict[str, Any], List[Any]]):
+    """Overload a generic kernel with the given argument types.
+
+    Can be called directly or used as a function decorator.
+
+    Args:
+        kernel: The generic kernel to be instantiated with concrete types.
+        arg_types: A list of concrete argument types for the kernel or a
+            dictionary specifying generic argument names as keys and concrete
+            types as variables.
+    """
     if isinstance(kernel, Kernel):
         # handle cases where user calls us directly, e.g. wp.overload(kernel, [args...])
 
@@ -1226,16 +1237,16 @@ def add_builtin(
                 typelists.append(l)
 
             for arg_types in itertools.product(*typelists):
-                arg_types = dict(zip(input_types.keys(), arg_types))
+                concrete_arg_types = dict(zip(input_types.keys(), arg_types))
 
                 # Some of these argument lists won't work, eg if the function is mul(), we won't be
                 # able to do a matrix vector multiplication for a mat22 and a vec3. The `constraint`
                 # function determines which combinations are valid:
                 if constraint:
-                    if constraint(arg_types) is False:
+                    if constraint(concrete_arg_types) is False:
                         continue
 
-                return_type = value_func(arg_types, None)
+                return_type = value_func(concrete_arg_types, None)
 
                 # The return_type might just be vector_t(length=3,dtype=wp.float32), so we've got to match that
                 # in the list of hard coded types so it knows it's returning one of them:
@@ -1253,7 +1264,7 @@ def add_builtin(
                 # finally we can generate a function call for these concrete types:
                 add_builtin(
                     key,
-                    input_types=arg_types,
+                    input_types=concrete_arg_types,
                     value_type=return_type,
                     value_func=value_func if return_type is Any else None,
                     export_func=export_func,
@@ -1617,6 +1628,17 @@ class ModuleBuilder:
             # use dict to preserve import order
             self.functions[func] = None
 
+    def build_meta(self):
+        meta = {}
+
+        for kernel in self.kernels:
+            name = kernel.get_mangled_name()
+
+            meta[name + "_cuda_kernel_forward_smem_bytes"] = kernel.adj.get_total_required_shared()
+            meta[name + "_cuda_kernel_backward_smem_bytes"] = kernel.adj.get_total_required_shared() * 2
+
+        return meta
+
     def codegen(self, device):
         source = ""
 
@@ -1676,11 +1698,12 @@ class ModuleExec:
         instance.handle = None
         return instance
 
-    def __init__(self, handle, module_hash, device):
+    def __init__(self, handle, module_hash, device, meta):
         self.handle = handle
         self.module_hash = module_hash
         self.device = device
         self.kernel_hooks = {}
+        self.meta = meta
 
     # release the loaded module
     def __del__(self):
@@ -1704,12 +1727,40 @@ class ModuleExec:
         name = kernel.get_mangled_name()
 
         if self.device.is_cuda:
-            forward = runtime.core.cuda_get_kernel(
-                self.device.context, self.handle, (name + "_cuda_kernel_forward").encode("utf-8")
+            forward_name = name + "_cuda_kernel_forward"
+            forward_kernel = runtime.core.cuda_get_kernel(
+                self.device.context, self.handle, forward_name.encode("utf-8")
             )
-            backward = runtime.core.cuda_get_kernel(
-                self.device.context, self.handle, (name + "_cuda_kernel_backward").encode("utf-8")
+
+            backward_name = name + "_cuda_kernel_backward"
+            backward_kernel = runtime.core.cuda_get_kernel(
+                self.device.context, self.handle, backward_name.encode("utf-8")
             )
+
+            # look up the required shared memory size for each kernel from module metadata
+            forward_smem_bytes = self.meta[forward_name + "_smem_bytes"]
+            backward_smem_bytes = self.meta[backward_name + "_smem_bytes"]
+
+            # configure kernels maximum shared memory size
+            max_smem_bytes = runtime.core.cuda_get_max_shared_memory(self.device.context)
+
+            if not runtime.core.cuda_configure_kernel_shared_memory(forward_kernel, forward_smem_bytes):
+                print(
+                    f"Warning: Failed to configure kernel dynamic shared memory for this device, tried to configure {forward_name} kernel for {forward_smem_bytes} bytes, but maximum available is {max_smem_bytes}"
+                )
+
+            options = dict(kernel.module.options)
+            options.update(kernel.options)
+
+            if options["enable_backward"] and not runtime.core.cuda_configure_kernel_shared_memory(
+                backward_kernel, backward_smem_bytes
+            ):
+                print(
+                    f"Warning: Failed to configure kernel dynamic shared memory for this device, tried to configure {backward_name} kernel for {backward_smem_bytes} bytes, but maximum available is {max_smem_bytes}"
+                )
+
+            hooks = KernelHooks(forward_kernel, backward_kernel, forward_smem_bytes, backward_smem_bytes)
+
         else:
             func = ctypes.CFUNCTYPE(None)
             forward = (
@@ -1719,9 +1770,9 @@ class ModuleExec:
                 func(runtime.llvm.lookup(self.handle.encode("utf-8"), (name + "_cpu_backward").encode("utf-8"))) or None
             )
 
-        hooks = KernelHooks(forward, backward)
-        self.kernel_hooks[kernel.adj] = hooks
+            hooks = KernelHooks(forward, backward)
 
+        self.kernel_hooks[kernel.adj] = hooks
         return hooks
 
 
@@ -1731,7 +1782,8 @@ class ModuleExec:
 # build cache
 class Module:
     def __init__(self, name, loader):
-        self.name = name
+        self.name = name if name is not None else "None"
+
         self.loader = loader
 
         # lookup the latest versions of kernels, functions, and structs by key
@@ -2067,6 +2119,15 @@ class Module:
                         module_load_timer.extra_msg = " (error)"
                         raise (e)
 
+                # ------------------------------------------------------------
+                # build meta data
+
+                meta = builder.build_meta()
+                meta_path = os.path.join(build_dir, "module_codegen.meta")
+
+                with open(meta_path, "w") as meta_file:
+                    json.dump(meta, meta_file)
+
                 # -----------------------------------------------------------
                 # update cache
 
@@ -2103,18 +2164,23 @@ class Module:
 
             # -----------------------------------------------------------
             # Load CPU or CUDA binary
+
+            meta_path = os.path.join(module_dir, "module_codegen.meta")
+            with open(meta_path, "r") as meta_file:
+                meta = json.load(meta_file)
+
             if device.is_cpu:
                 # LLVM modules are identified using strings, so we need to ensure uniqueness
                 module_handle = f"{module_name}_{self.cpu_exec_id}"
                 self.cpu_exec_id += 1
                 runtime.llvm.load_obj(binary_path.encode("utf-8"), module_handle.encode("utf-8"))
-                module_exec = ModuleExec(module_handle, module_hash, device)
+                module_exec = ModuleExec(module_handle, module_hash, device, meta)
                 self.execs[None] = module_exec
 
             elif device.is_cuda:
                 cuda_module = warp.build.load_cuda(binary_path, device)
                 if cuda_module is not None:
-                    module_exec = ModuleExec(cuda_module, module_hash, device)
+                    module_exec = ModuleExec(cuda_module, module_hash, device, meta)
                     self.execs[device.context] = module_exec
                 else:
                     module_load_timer.extra_msg = " (error)"
@@ -2769,21 +2835,16 @@ class Graph:
 
 class Runtime:
     def __init__(self):
-        if sys.version_info < (3, 7):
-            raise RuntimeError("Warp requires Python 3.7 as a minimum")
+        if sys.version_info < (3, 8):
+            raise RuntimeError("Warp requires Python 3.8 as a minimum")
         if sys.version_info < (3, 9):
             warp.utils.warn(f"Python 3.9 or newer is recommended for running Warp, detected {sys.version_info}")
 
         bin_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "bin")
 
         if os.name == "nt":
-            if sys.version_info >= (3, 8):
-                # Python >= 3.8 this method to add dll search paths
-                os.add_dll_directory(bin_path)
-
-            else:
-                # Python < 3.8 we add dll directory to path
-                os.environ["PATH"] = bin_path + os.pathsep + os.environ["PATH"]
+            # Python >= 3.8 this method to add dll search paths
+            os.add_dll_directory(bin_path)
 
             warp_lib = os.path.join(bin_path, "warp.dll")
             llvm_lib = os.path.join(bin_path, "warp-clang.dll")
@@ -2998,6 +3059,9 @@ class Runtime:
 
             self.core.radix_sort_pairs_int_host.argtypes = [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_int]
             self.core.radix_sort_pairs_int_device.argtypes = [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_int]
+
+            self.core.radix_sort_pairs_float_host.argtypes = [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_int]
+            self.core.radix_sort_pairs_float_device.argtypes = [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_int]
 
             self.core.runlength_encode_int_host.argtypes = [
                 ctypes.c_uint64,
@@ -3442,10 +3506,17 @@ class Runtime:
             self.core.cuda_get_kernel.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p]
             self.core.cuda_get_kernel.restype = ctypes.c_void_p
 
+            self.core.cuda_get_max_shared_memory.argtypes = [ctypes.c_void_p]
+            self.core.cuda_get_max_shared_memory.restype = ctypes.c_int
+
+            self.core.cuda_configure_kernel_shared_memory.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            self.core.cuda_configure_kernel_shared_memory.restype = ctypes.c_bool
+
             self.core.cuda_launch_kernel.argtypes = [
                 ctypes.c_void_p,
                 ctypes.c_void_p,
                 ctypes.c_size_t,
+                ctypes.c_int,
                 ctypes.c_int,
                 ctypes.c_int,
                 ctypes.POINTER(ctypes.c_void_p),
@@ -3475,6 +3546,23 @@ class Runtime:
             self.core.cuda_timing_get_result_count.restype = int
             self.core.cuda_timing_end.argtypes = []
             self.core.cuda_timing_end.restype = None
+
+            self.core.graph_coloring.argtypes = [
+                ctypes.c_int,
+                warp.types.array_t,
+                ctypes.c_int,
+                warp.types.array_t,
+            ]
+            self.core.graph_coloring.restype = ctypes.c_int
+
+            self.core.balance_coloring.argtypes = [
+                ctypes.c_int,
+                warp.types.array_t,
+                ctypes.c_int,
+                ctypes.c_float,
+                warp.types.array_t,
+            ]
+            self.core.balance_coloring.restype = ctypes.c_float
 
             self.core.init.restype = ctypes.c_int
 
@@ -3701,10 +3789,7 @@ class Runtime:
 
     def load_dll(self, dll_path):
         try:
-            if sys.version_info >= (3, 8):
-                dll = ctypes.CDLL(dll_path, winmode=0)
-            else:
-                dll = ctypes.CDLL(dll_path)
+            dll = ctypes.CDLL(dll_path, winmode=0)
         except OSError as e:
             if "GLIBCXX" in str(e):
                 raise RuntimeError(
@@ -3845,7 +3930,7 @@ def is_cuda_available() -> bool:
     return get_cuda_device_count() > 0
 
 
-def is_device_available(device):
+def is_device_available(device: Device) -> bool:
     return device in get_devices()
 
 
@@ -3905,7 +3990,7 @@ def get_cuda_devices() -> List[Device]:
 
 
 def get_preferred_device() -> Device:
-    """Returns the preferred compute device, CUDA if available and CPU otherwise."""
+    """Returns the preferred compute device, ``cuda:0`` if available and ``cpu`` otherwise."""
 
     init()
 
@@ -3990,7 +4075,7 @@ def set_mempool_enabled(device: Devicelike, enable: bool) -> None:
     They should generally be enabled, but there is a rare caveat.  Copying data between different GPUs
     may fail during graph capture if the memory was allocated using pooled allocators and memory pool
     access is not enabled between the two GPUs.  This is an internal CUDA limitation that is not related
-    to Warp.  The preferred solution is to enable memory pool access using `warp.set_mempool_access_enabled()`.
+    to Warp.  The preferred solution is to enable memory pool access using :func:`set_mempool_access_enabled`.
     If peer access is not supported, then the default CUDA allocators must be used to pre-allocate the memory
     prior to graph capture.
     """
@@ -4045,7 +4130,7 @@ def set_mempool_release_threshold(device: Devicelike, threshold: Union[int, floa
 
 
 def get_mempool_release_threshold(device: Devicelike) -> int:
-    """Get the CUDA memory pool release threshold on the device."""
+    """Get the CUDA memory pool release threshold on the device in bytes."""
 
     init()
 
@@ -4064,7 +4149,7 @@ def is_peer_access_supported(target_device: Devicelike, peer_device: Devicelike)
     """Check if `peer_device` can directly access the memory of `target_device` on this system.
 
     This applies to memory allocated using default CUDA allocators.  For memory allocated using
-    CUDA pooled allocators, use `is_mempool_access_supported()`.
+    CUDA pooled allocators, use :func:`is_mempool_access_supported()`.
 
     Returns:
         A Boolean value indicating if this peer access is supported by the system.
@@ -4085,7 +4170,7 @@ def is_peer_access_enabled(target_device: Devicelike, peer_device: Devicelike) -
     """Check if `peer_device` can currently access the memory of `target_device`.
 
     This applies to memory allocated using default CUDA allocators.  For memory allocated using
-    CUDA pooled allocators, use `is_mempool_access_enabled()`.
+    CUDA pooled allocators, use :func:`is_mempool_access_enabled()`.
 
     Returns:
         A Boolean value indicating if this peer access is currently enabled.
@@ -4109,7 +4194,7 @@ def set_peer_access_enabled(target_device: Devicelike, peer_device: Devicelike, 
     a negative impact on memory consumption and allocation performance.
 
     This applies to memory allocated using default CUDA allocators.  For memory allocated using
-    CUDA pooled allocators, use `set_mempool_access_enabled()`.
+    CUDA pooled allocators, use :func:`set_mempool_access_enabled()`.
     """
 
     init()
@@ -4137,7 +4222,8 @@ def set_peer_access_enabled(target_device: Devicelike, peer_device: Devicelike, 
 def is_mempool_access_supported(target_device: Devicelike, peer_device: Devicelike) -> bool:
     """Check if `peer_device` can directly access the memory pool of `target_device`.
 
-    If mempool access is possible, it can be managed using `set_mempool_access_enabled()` and `is_mempool_access_enabled()`.
+    If mempool access is possible, it can be managed using :func:`set_mempool_access_enabled()`
+    and :func:`is_mempool_access_enabled()`.
 
     Returns:
         A Boolean value indicating if this memory pool access is supported by the system.
@@ -4155,7 +4241,7 @@ def is_mempool_access_enabled(target_device: Devicelike, peer_device: Devicelike
     """Check if `peer_device` can currently access the memory pool of `target_device`.
 
     This applies to memory allocated using CUDA pooled allocators.  For memory allocated using
-    default CUDA allocators, use `is_peer_access_enabled()`.
+    default CUDA allocators, use :func:`is_peer_access_enabled()`.
 
     Returns:
         A Boolean value indicating if this peer access is currently enabled.
@@ -4176,7 +4262,7 @@ def set_mempool_access_enabled(target_device: Devicelike, peer_device: Devicelik
     """Enable or disable access from `peer_device` to the memory pool of `target_device`.
 
     This applies to memory allocated using CUDA pooled allocators.  For memory allocated using
-    default CUDA allocators, use `set_peer_access_enabled()`.
+    default CUDA allocators, use :func:`set_peer_access_enabled()`.
     """
 
     init()
@@ -5009,6 +5095,7 @@ class Launch:
                 self.bounds.size,
                 self.max_blocks,
                 self.block_dim,
+                self.hooks.forward_smem_bytes,
                 self.params_addr,
                 stream.cuda_stream,
             )
@@ -5101,7 +5188,12 @@ def launch(
             kernel = kernel.add_overload(fwd_types)
 
         # delay load modules, including new overload if needed
-        module_exec = kernel.module.load(device, block_dim)
+        try:
+            module_exec = kernel.module.load(device, block_dim)
+        except Exception:
+            kernel.adj.skip_build = True
+            raise
+
         if not module_exec:
             return
 
@@ -5162,6 +5254,7 @@ def launch(
                     bounds.size,
                     max_blocks,
                     block_dim,
+                    hooks.backward_smem_bytes,
                     kernel_params,
                     stream.cuda_stream,
                 )
@@ -5180,6 +5273,8 @@ def launch(
                         params_addr=kernel_params,
                         bounds=bounds,
                         device=device,
+                        max_blocks=max_blocks,
+                        block_dim=block_dim,
                     )
                     return launch
 
@@ -5191,6 +5286,7 @@ def launch(
                         bounds.size,
                         max_blocks,
                         block_dim,
+                        hooks.forward_smem_bytes,
                         kernel_params,
                         stream.cuda_stream,
                     )
@@ -5242,19 +5338,27 @@ def launch_tiled(*args, **kwargs):
             ...
     """
 
-    if len(kwargs["dim"]) > 3:
-        raise RuntimeError("wp.launch_tiled() requires a grid with fewer than 4 dimensions")
-
     # promote dim to a list in case it was passed as a scalar or tuple
+    if "dim" not in kwargs:
+        raise RuntimeError("Launch dimensions 'dim' argument should be passed via. keyword args for wp.launch_tiled()")
+
+    if "block_dim" not in kwargs:
+        raise RuntimeError(
+            "Launch block dimension 'block_dim' argument should be passed via. keyword args for wp.launch_tiled()"
+        )
+
     dim = kwargs["dim"]
     if not isinstance(dim, list):
         dim = list(dim) if isinstance(dim, tuple) else [dim]
+
+    if len(dim) > 3:
+        raise RuntimeError("wp.launch_tiled() requires a grid with fewer than 4 dimensions")
 
     # add trailing dimension
     kwargs["dim"] = dim + [kwargs["block_dim"]]
 
     # forward to original launch method
-    launch(*args, **kwargs)
+    return launch(*args, **kwargs)
 
 
 def synchronize():
@@ -5775,16 +5879,6 @@ def type_str(t):
         return "Any"
     elif t == Callable:
         return "Callable"
-    elif t == Tuple[int]:
-        return "Tuple[int]"
-    elif t == Tuple[int, int]:
-        return "Tuple[int, int]"
-    elif t == Tuple[int, int, int]:
-        return "Tuple[int, int, int]"
-    elif t == Tuple[int, int, int, int]:
-        return "Tuple[int, int, int, int]"
-    elif t == Tuple[int, ...]:
-        return "Tuple[int, ...]"
     elif isinstance(t, int):
         return str(t)
     elif isinstance(t, List):
@@ -5819,9 +5913,11 @@ def type_str(t):
             return f"Transformation[{type_str(t._wp_scalar_type_)}]"
 
         raise TypeError("Invalid vector or matrix dimensions")
-    elif typing.get_origin(t) in (List, Mapping, Sequence, Union, Tuple):
-        args_repr = ", ".join(type_str(x) for x in typing.get_args(t))
-        return f"{t.__name__}[{args_repr}]"
+    elif warp.codegen.get_type_origin(t) in (list, tuple):
+        args_repr = ", ".join(type_str(x) for x in warp.codegen.get_type_args(t))
+        return f"{t._name}[{args_repr}]"
+    elif t is Ellipsis:
+        return "..."
     elif warp.types.is_tile(t):
         return "Tile"
 

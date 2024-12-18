@@ -15,6 +15,7 @@ import numpy as np
 
 import warp as wp
 
+from .graph_coloring import ColoringAlgorithm, color_trimesh, combine_independent_particle_coloring
 from .inertia import (
     compute_box_inertia,
     compute_capsule_inertia,
@@ -577,14 +578,14 @@ class Model:
 
                This setting is not supported by :class:`FeatherstoneIntegrator`.
 
-        joint_limit_lower (array): Joint lower position limits, shape [joint_count], float
-        joint_limit_upper (array): Joint upper position limits, shape [joint_count], float
-        joint_limit_ke (array): Joint position limit stiffness (used by the Euler integrators), shape [joint_count], float
-        joint_limit_kd (array): Joint position limit damping (used by the Euler integrators), shape [joint_count], float
+        joint_limit_lower (array): Joint lower position limits, shape [joint_axis_count], float
+        joint_limit_upper (array): Joint upper position limits, shape [joint_axis_count], float
+        joint_limit_ke (array): Joint position limit stiffness (used by the Euler integrators), shape [joint_axis_count], float
+        joint_limit_kd (array): Joint position limit damping (used by the Euler integrators), shape [joint_axis_count], float
         joint_twist_lower (array): Joint lower twist limit, shape [joint_count], float
         joint_twist_upper (array): Joint upper twist limit, shape [joint_count], float
-        joint_q_start (array): Start index of the first position coordinate per joint, shape [joint_count], int
-        joint_qd_start (array): Start index of the first velocity coordinate per joint, shape [joint_count], int
+        joint_q_start (array): Start index of the first position coordinate per joint (note the last value is an additional sentinel entry to allow for querying the q dimensionality of joint i via ``joint_q_start[i+1] - joint_q_start[i]``), shape [joint_count + 1], int
+        joint_qd_start (array): Start index of the first velocity coordinate per joint (note the last value is an additional sentinel entry to allow for querying the qd dimensionality of joint i via ``joint_qd_start[i+1] - joint_qd_start[i]``), shape [joint_count + 1], int
         articulation_start (array): Articulation start index, shape [articulation_count], int
         joint_name (list): Joint names, shape [joint_count], str
         joint_attach_ke (float): Joint attachment force stiffness (used by :class:`SemiImplicitIntegrator`)
@@ -891,7 +892,7 @@ class Model:
             target.soft_contact_body_pos = wp.zeros(count, dtype=wp.vec3, requires_grad=requires_grad)
             target.soft_contact_body_vel = wp.zeros(count, dtype=wp.vec3, requires_grad=requires_grad)
             target.soft_contact_normal = wp.zeros(count, dtype=wp.vec3, requires_grad=requires_grad)
-            target.soft_contact_tids = wp.zeros(count, dtype=int)
+            target.soft_contact_tids = wp.zeros(self.particle_count * (self.shape_count - 1), dtype=int)
 
     def allocate_soft_contacts(self, count, requires_grad=False):
         self._allocate_soft_contacts(self, count, requires_grad)
@@ -1134,6 +1135,8 @@ class ModelBuilder:
         self.particle_radius = []
         self.particle_flags = []
         self.particle_max_velocity = 1e5
+        # list of np.array
+        self.particle_coloring = []
 
         # shapes (each shape has an entry in these arrays)
         # transform from shape to body
@@ -1372,6 +1375,11 @@ class ModelBuilder:
         if builder.tet_count:
             self.tet_indices.extend((np.array(builder.tet_indices, dtype=np.int32) + start_particle_idx).tolist())
 
+        builder_coloring_translated = [group + start_particle_idx for group in builder.particle_coloring]
+        self.particle_coloring = combine_independent_particle_coloring(
+            self.particle_coloring, builder_coloring_translated
+        )
+
         start_body_idx = self.body_count
         start_shape_idx = self.shape_count
         for s, b in enumerate(builder.shape_body):
@@ -1434,12 +1442,14 @@ class ModelBuilder:
             self.shape_collision_filter_pairs.add((i + shape_count, j + shape_count))
         for group, shapes in builder.shape_collision_group_map.items():
             if separate_collision_group:
-                group = self.last_collision_group + 1
+                extend_group = self.last_collision_group + 1
             else:
-                group = group + self.last_collision_group if group > -1 else -1
-            if group not in self.shape_collision_group_map:
-                self.shape_collision_group_map[group] = []
-            self.shape_collision_group_map[group].extend([s + shape_count for s in shapes])
+                extend_group = group + self.last_collision_group if group > -1 else -1
+
+            if extend_group not in self.shape_collision_group_map:
+                self.shape_collision_group_map[extend_group] = []
+
+            self.shape_collision_group_map[extend_group].extend([s + shape_count for s in shapes])
 
         # update last collision group counter
         if separate_collision_group:
@@ -2608,11 +2618,12 @@ class ModelBuilder:
             joint_remap[joint["original_id"]] = i
         # update articulation_start
         for i, old_i in enumerate(self.articulation_start):
-            while old_i not in joint_remap:
-                old_i += 1
-                if old_i >= self.joint_count:
+            start_i = old_i
+            while start_i not in joint_remap:
+                start_i += 1
+                if start_i >= self.joint_count:
                     break
-            self.articulation_start[i] = joint_remap.get(old_i, old_i)
+            self.articulation_start[i] = joint_remap.get(start_i, start_i)
         # remove empty articulation starts, i.e. where the start and end are the same
         self.articulation_start = list(set(self.articulation_start))
 
@@ -3421,7 +3432,12 @@ class ModelBuilder:
 
     # particles
     def add_particle(
-        self, pos: Vec3, vel: Vec3, mass: float, radius: float = None, flags: wp.uint32 = PARTICLE_FLAG_ACTIVE
+        self,
+        pos: Vec3,
+        vel: Vec3,
+        mass: float,
+        radius: float = None,
+        flags: wp.uint32 = PARTICLE_FLAG_ACTIVE,
     ) -> int:
         """Adds a single particle to the model
 
@@ -3446,7 +3462,9 @@ class ModelBuilder:
         self.particle_radius.append(radius)
         self.particle_flags.append(flags)
 
-        return len(self.particle_q) - 1
+        particle_id = self.particle_count - 1
+
+        return particle_id
 
     def add_spring(self, i: int, j, ke: float, kd: float, control: float):
         """Adds a spring between two particles in the system
@@ -3826,6 +3844,7 @@ class ModelBuilder:
         add_springs: bool = False,
         spring_ke: float = default_spring_ke,
         spring_kd: float = default_spring_kd,
+        particle_radius: float = default_particle_radius,
     ):
         """Helper to create a regular planar cloth grid
 
@@ -3846,7 +3865,6 @@ class ModelBuilder:
             fix_right: Make the right-most edge of particles kinematic
             fix_top: Make the top-most edge of particles kinematic
             fix_bottom: Make the bottom-most edge of particles kinematic
-
         """
 
         def grid_index(x, y, dim_x):
@@ -3876,7 +3894,7 @@ class ModelBuilder:
                     m = 0.0
                     particle_flag = wp.uint32(int(particle_flag) & ~int(PARTICLE_FLAG_ACTIVE))
 
-                self.add_particle(p, vel, m, flags=particle_flag)
+                self.add_particle(p, vel, m, flags=particle_flag, radius=particle_radius)
 
                 if x > 0 and y > 0:
                     if reverse_winding:
@@ -3960,6 +3978,7 @@ class ModelBuilder:
         add_springs: bool = False,
         spring_ke: float = default_spring_ke,
         spring_kd: float = default_spring_kd,
+        particle_radius: float = default_particle_radius,
     ):
         """Helper to create a cloth model from a regular triangle mesh
 
@@ -3975,7 +3994,7 @@ class ModelBuilder:
             density: The density per-area of the mesh
             edge_callback: A user callback when an edge is created
             face_callback: A user callback when a face is created
-
+            particle_radius: The particle_radius which controls particle based collisions.
         Note:
 
             The mesh should be two manifold.
@@ -3989,7 +4008,7 @@ class ModelBuilder:
         for v in vertices:
             p = wp.quat_rotate(rot, v * scale) + pos
 
-            self.add_particle(p, vel, 0.0)
+            self.add_particle(p, vel, 0.0, radius=particle_radius)
 
         # triangles
         inds = start_vertex + np.array(indices)
@@ -4016,22 +4035,22 @@ class ModelBuilder:
 
         adj = wp.utils.MeshAdjacency(self.tri_indices[start_tri:end_tri], end_tri - start_tri)
 
-        edgeinds = np.fromiter(
+        edge_indices = np.fromiter(
             (x for e in adj.edges.values() for x in (e.o0, e.o1, e.v0, e.v1)),
             int,
         ).reshape(-1, 4)
         self.add_edges(
-            edgeinds[:, 0],
-            edgeinds[:, 1],
-            edgeinds[:, 2],
-            edgeinds[:, 3],
-            edge_ke=[edge_ke] * len(edgeinds),
-            edge_kd=[edge_kd] * len(edgeinds),
+            edge_indices[:, 0],
+            edge_indices[:, 1],
+            edge_indices[:, 2],
+            edge_indices[:, 3],
+            edge_ke=[edge_ke] * len(edge_indices),
+            edge_kd=[edge_kd] * len(edge_indices),
         )
 
         if add_springs:
             spring_indices = set()
-            for i, j, k, l in edgeinds:
+            for i, j, k, l in edge_indices:
                 spring_indices.add((min(i, j), max(i, j)))
                 spring_indices.add((min(i, k), max(i, k)))
                 spring_indices.add((min(i, l), max(i, l)))
@@ -4253,8 +4272,7 @@ class ModelBuilder:
         pos = wp.vec3(pos[0], pos[1], pos[2])
         # add particles
         for v in vertices:
-            v = wp.vec3(v[0], v[1], v[2])
-            p = wp.quat_rotate(rot, v * scale) + pos
+            p = wp.quat_rotate(rot, wp.vec3(v[0], v[1], v[2]) * scale) + pos
 
             self.add_particle(p, vel, 0.0)
 
@@ -4356,6 +4374,63 @@ class ModelBuilder:
         for i in range(self.shape_count - 1):
             self.shape_collision_filter_pairs.add((i, ground_id))
 
+    def set_coloring(self, particle_coloring):
+        """
+        Set coloring information with user-provided coloring.
+
+        Args:
+            particle_coloring: A list of list or `np.array` with `dtype`=`int`. The length of the list is the number of colors
+             and each list or `np.array` contains the indices of vertices with this color.
+        """
+        particle_coloring = [
+            color_group if isinstance(color_group, np.ndarray) else np.array(color_group)
+            for color_group in particle_coloring
+        ]
+        self.particle_coloring = particle_coloring
+
+    def color(
+        self,
+        include_bending=False,
+        balance_colors=True,
+        target_max_min_color_ratio=1.1,
+        coloring_algorithm=ColoringAlgorithm.MCS,
+    ):
+        """
+        Run coloring algorithm to generate coloring information.
+
+        Args:
+            include_bending_energy: Whether to consider bending energy for trimeshes in the coloring process. If set to `True`, the generated
+                graph will contain all the edges connecting o1 and o2; otherwise, the graph will be equivalent to the trimesh.
+            balance_colors: Whether to apply the color balancing algorithm to balance the size of each color
+            target_max_min_color_ratio: the color balancing algorithm will stop when the ratio between the largest color and
+                the smallest color reaches this value
+            algorithm: Value should be an enum type of ColoringAlgorithm, otherwise it will raise an error. ColoringAlgorithm.mcs means using the MCS coloring algorithm,
+                while ColoringAlgorithm.ordered_greedy means using the degree-ordered greedy algorithm. The MCS algorithm typically generates 30% to 50% fewer colors
+                compared to the ordered greedy algorithm, while maintaining the same linear complexity. Although MCS has a constant overhead that makes it about twice
+                as slow as the greedy algorithm, it produces significantly better coloring results. We recommend using MCS, especially if coloring is only part of the
+                preprocessing.
+
+        Note:
+
+            References to the coloring algorithm:
+
+            MCS: Pereira, F. M. Q., & Palsberg, J. (2005, November). Register allocation via coloring of chordal graphs. In Asian Symposium on Programming Languages and Systems (pp. 315-329). Berlin, Heidelberg: Springer Berlin Heidelberg.
+
+            Ordered Greedy: Ton-That, Q. M., Kry, P. G., & Andrews, S. (2023). Parallel block Neo-Hookean XPBD using graph clustering. Computers & Graphics, 110, 1-10.
+
+        """
+        # ignore bending energy if it is too small
+        edge_indices = np.array(self.edge_indices)
+
+        self.particle_coloring = color_trimesh(
+            len(self.particle_q),
+            edge_indices,
+            include_bending,
+            algorithm=coloring_algorithm,
+            balance_colors=balance_colors,
+            target_max_min_color_ratio=target_max_min_color_ratio,
+        )
+
     def finalize(self, device=None, requires_grad=False) -> Model:
         """Convert this builder object to a concrete model for simulation.
 
@@ -4406,6 +4481,8 @@ class ModelBuilder:
             m.particle_flags = wp.array([flag_to_int(f) for f in self.particle_flags], dtype=wp.uint32)
             m.particle_max_radius = np.max(self.particle_radius) if len(self.particle_radius) > 0 else 0.0
             m.particle_max_velocity = self.particle_max_velocity
+
+            m.particle_coloring = [wp.array(group, dtype=int) for group in self.particle_coloring]
 
             # hash-grid for particle interactions
             m.particle_grid = wp.HashGrid(128, 128, 128)

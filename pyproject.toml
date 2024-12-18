@@ -4,16 +4,17 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "warp-lang"
-requires-python = ">=3.7" # 3.9 recommended
+requires-python = ">=3.8" # 3.9 recommended
 authors = [{ name = "NVIDIA Corporation", email = "mmacklin@nvidia.com" }]
 description = "A Python framework for high-performance simulation and graphics programming"
 license = { text = "NVIDIA Software License" }
 classifiers = [
-    "Programming Language :: Python :: 3.7",  # Deprecated
     "Programming Language :: Python :: 3.8",  # Deprecated
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3 :: Only",
     "License :: Other/Proprietary License",
     "Operating System :: OS Independent",
 ]
@@ -26,7 +27,7 @@ Documentation = "https://nvidia.github.io/warp"
 Changelog = "https://github.com/NVIDIA/warp/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
-dev = ["pre-commit", "ruff", "nvtx", "furo", "sphinx-copybutton", "coverage[toml]"]
+dev = ["pre-commit", "ruff", "nvtx", "nvidia-sphinx-theme", "sphinx-copybutton", "coverage[toml]"]
 extras = ['usd-core', 'matplotlib', 'pyglet']
 
 [tool.setuptools.packages.find]
@@ -41,6 +42,7 @@ cache-dir = ".cache/ruff"
 line-length = 120
 indent-width = 4
 extend-exclude = [
+    "notebooks",
     "warp/native/cutlass/",
     "warp/thirdparty/appdirs.py",
     "warp/thirdparty/dlpack.py",
@@ -56,6 +58,10 @@ select = [
     "W",  # pycodestyle warnings
     "B",  # flake8-bugbear
     "C4",  # flake8-comprehensions
+    "NPY",  # NumPy-specific rules
+    "PLC",  # pylint convention
+    "PLE",  # pylint error
+    "PLW"  # pylint warning
 ]
 ignore = [
     "E501", # Many lines are over 120 characters already
@@ -64,6 +70,7 @@ ignore = [
     "F405", # Related to use of wildcard imports
     "F811", # Warp often uses overloads
     "E721", # Warp often uses == in float and int type comparisons
+    "PLW0603" # Allow assignments to global variables
 ]
 
 [tool.ruff.lint.per-file-ignores]

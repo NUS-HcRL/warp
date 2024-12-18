@@ -1,11 +1,17 @@
 Tiles
 =====
 
+.. currentmodule:: warp
+
 .. warning:: Tile-based operations in Warp are under preview, APIs are subject to change.
 
-Block-based programming models such as those in OpenAI Triton have proved to be effective ways of expressing high-performance kernels that can leverage cooperative operations on modern GPUs.
+Block-based programming models such as those in OpenAI Triton have proved to be effective ways of expressing high-performance kernels that can leverage cooperative operations on modern GPUs. With Warp 1.5.0 developers now have access to new tile-based programming primitives in Warp kernels. Leveraging cuBLASDx and cuFFTDx, these new tools provide developers with efficient matrix multiplication and Fourier transforms for accelerated simulation and scientific computing. 
 
-Warp 1.4.0 introduces tile extensions that expose a block-based programming to Warp kernels. 
+Requirements
+------------
+
+Tile-based operations are currently only supported on versions of Warp built against the CUDA 12 runtime.
+See `Building with MathDx`_ for more details when building the Warp locally with support for tile operations.
 
 Execution Model
 ---------------
@@ -29,7 +35,7 @@ In the following example, we launch a grid of threads where each block is respon
 
         # load a row from global memory
         t = wp.tile_load(array[i], i, TILE_SIZE)
-        s = wp.sum(t)
+        s = wp.tile_sum(t)
         ...
 
     wp.launch_tiled(compute, dim=[a.shape[0]], inputs=[a], block_dim=TILE_THREADS)
@@ -56,7 +62,7 @@ In Warp, tile objects are 2D arrays of data where the tile elements may be scala
 
         # load a 2d tile from global memory
         t = wp.tile_load(array, i, j, m=TILE_M, n=TILE_N)
-        s = wp.sum(t)
+        s = wp.tile_sum(t)
         ...
 
     wp.launch_tiled(compute, dim=[a.shape[0]/TILE_M, a.shape[1]/TILE_N], inputs=[a], block_dim=TILE_THREADS)
@@ -165,35 +171,37 @@ Tile Operations
 Construction
 ^^^^^^^^^^^^
 
-* :func:`warp.tile_zeros`
-* :func:`warp.tile_ones`
-* :func:`warp.tile_arange`
-* :func:`warp.tile`
-* :func:`warp.untile`
+* :func:`tile_zeros`
+* :func:`tile_ones`
+* :func:`tile_arange`
+* :func:`tile`
+* :func:`untile`
+* :func:`tile_view`
+* :func:`tile_broadcast`
 
 Load/Store
 ^^^^^^^^^^
 
-* :func:`warp.tile_load`
-* :func:`warp.tile_store`
-* :func:`warp.tile_atomic_add`
+* :func:`tile_load`
+* :func:`tile_store`
+* :func:`tile_atomic_add`
 
 Maps/Reductions
 ^^^^^^^^^^^^^^^
 
-* :func:`warp.tile_map`
-* :func:`warp.tile_reduce`
-* :func:`warp.tile_sum`
-* :func:`warp.tile_min`
-* :func:`warp.tile_max`
+* :func:`tile_map`
+* :func:`tile_reduce`
+* :func:`tile_sum`
+* :func:`tile_min`
+* :func:`tile_max`
 
 Linear Algebra
 ^^^^^^^^^^^^^^
 
-* :func:`warp.tile_matmul`
-* :func:`warp.tile_transpose`
-* :func:`warp.tile_fft`
-* :func:`warp.tile_ifft`
+* :func:`tile_matmul`
+* :func:`tile_transpose`
+* :func:`tile_fft`
+* :func:`tile_ifft`
 
 Tiles and SIMT Code
 -------------------
@@ -231,3 +239,15 @@ Automatic Differentiation
 Warp can automatically generate the backward version of tile-based programs.
 In general, tile programs must obey the same rules for auto-diff as regular Warp programs, e.g. avoiding in-place operations, etc.
 Please see the :ref:`differentiability` section for more details.
+
+Building with MathDx
+--------------------
+
+The tile operations described in `Linear Algebra`_ require Warp to be built with the MathDx library.
+Starting with Warp 1.5.0, PyPI distributions will come with out-of-the-box support for tile operations
+leveraging MathDx APIs.
+
+When building Warp locally using ``build_lib.py``, the script will attempt to automatically download ``libmathdx``
+from the `cuBLASDx Downloads Page <https://developer.nvidia.com/cublasdx-downloads>`__.
+A path to an existing ``libmathdx`` installation can also be specified using the ``--libmathdx_path`` option
+when running ``build_lib.py`` or by defining the path in the ``LIBMATHDX_HOME`` environment variable.

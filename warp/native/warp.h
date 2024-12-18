@@ -159,6 +159,9 @@ extern "C"
     WP_API void radix_sort_pairs_int_host(uint64_t keys, uint64_t values, int n);
     WP_API void radix_sort_pairs_int_device(uint64_t keys, uint64_t values, int n);
 
+    WP_API void radix_sort_pairs_float_host(uint64_t keys, uint64_t values, int n);
+    WP_API void radix_sort_pairs_float_device(uint64_t keys, uint64_t values, int n);
+
     WP_API void runlength_encode_int_host(uint64_t values, uint64_t run_values, uint64_t run_lengths, uint64_t run_count, int n);
     WP_API void runlength_encode_int_device(uint64_t values, uint64_t run_values, uint64_t run_lengths, uint64_t run_count, int n);
 
@@ -324,7 +327,9 @@ extern "C"
     WP_API void* cuda_load_module(void* context, const char* ptx);
     WP_API void cuda_unload_module(void* context, void* module);
     WP_API void* cuda_get_kernel(void* context, void* module, const char* name);
-    WP_API size_t cuda_launch_kernel(void* context, void* kernel, size_t dim, int max_blocks, int tile_size, void** args, void* stream);
+    WP_API size_t cuda_launch_kernel(void* context, void* kernel, size_t dim, int max_blocks, int block_dim, int shared_memory_bytes, void** args, void* stream);
+    WP_API int cuda_get_max_shared_memory(void* context);
+    WP_API bool cuda_configure_kernel_shared_memory(void* kernel, int size);
 
     WP_API void cuda_set_context_restore_policy(bool always_restore);
     WP_API int cuda_get_context_restore_policy();
@@ -340,4 +345,8 @@ extern "C"
     WP_API int cuda_timing_get_result_count();
     WP_API void cuda_timing_end(timing_result_t* results, int size);
 
+    // graph coloring
+    WP_API int graph_coloring(int num_nodes, wp::array_t<int> edges, int algorithm, wp::array_t<int> node_colors);
+    WP_API float balance_coloring(int num_nodes, wp::array_t<int> edges, int num_colors, float target_max_min_ratio, wp::array_t<int> node_colors);
+        
 } // extern "C"
