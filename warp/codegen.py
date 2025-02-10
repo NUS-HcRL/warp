@@ -282,9 +282,9 @@ class StructInstance:
             else:
                 # wp.array
                 assert isinstance(value, array)
-                assert types_equal(
-                    value.dtype, var.type.dtype
-                ), f"assign to struct member variable {name} failed, expected type {type_repr(var.type.dtype)}, got type {type_repr(value.dtype)}"
+                assert types_equal(value.dtype, var.type.dtype), (
+                    f"assign to struct member variable {name} failed, expected type {type_repr(var.type.dtype)}, got type {type_repr(value.dtype)}"
+                )
                 setattr(self._ctype, name, value.__ctype__())
 
         elif isinstance(var.type, Struct):
@@ -606,6 +606,9 @@ def compute_type_str(base_name, template_params):
                 return "bool"
             else:
                 return f"wp::{p.__name__}"
+        elif is_tile(p):
+            return p.ctype()
+
         return p.__name__
 
     return f"{base_name}<{','.join(map(param2str, template_params))}>"
@@ -947,7 +950,7 @@ class Adjoint:
         total_shared = 0
 
         for var in adj.variables:
-            if is_tile(var.type) and var.type.storage == "shared":
+            if is_tile(var.type) and var.type.storage == "shared" and var.type.owner:
                 total_shared += var.type.size_in_bytes()
 
         return total_shared + adj.max_required_extra_shared_memory
@@ -1138,6 +1141,9 @@ class Adjoint:
 
         if isinstance(var, (Reference, warp.context.Function)):
             return var
+
+        if isinstance(var, int):
+            return adj.add_constant(var)
 
         if var.label is None:
             return adj.add_var(var.type, var.constant)
@@ -1349,8 +1355,9 @@ class Adjoint:
         # which allows for some more advanced resolution to be performed,
         # for example by checking whether an argument corresponds to
         # a literal value or references a variable.
+        extra_shared_memory = 0
         if func.lto_dispatch_func is not None:
-            func_args, template_args, ltoirs = func.lto_dispatch_func(
+            func_args, template_args, ltoirs, extra_shared_memory = func.lto_dispatch_func(
                 func.input_types, return_type, output_list, bound_args, options=adj.builder_options, builder=adj.builder
             )
         elif func.dispatch_func is not None:
@@ -1424,7 +1431,9 @@ class Adjoint:
         # update our smem roofline requirements based on any
         # shared memory required by the dependent function call
         if not func.is_builtin():
-            adj.alloc_shared_extra(func.adj.get_total_required_shared())
+            adj.alloc_shared_extra(func.adj.get_total_required_shared() + extra_shared_memory)
+        else:
+            adj.alloc_shared_extra(extra_shared_memory)
 
         return output
 
@@ -1527,7 +1536,8 @@ class Adjoint:
         # zero adjoints
         for i in body_block.vars:
             if is_tile(i.type):
-                reverse.append(adj.indentation + f"\t{i.emit_adj()}.grad_zero();")
+                if i.type.owner:
+                    reverse.append(adj.indentation + f"\t{i.emit_adj()}.grad_zero();")
             else:
                 reverse.append(adj.indentation + f"\t{i.emit_adj()} = {{}};")
 
@@ -1911,11 +1921,24 @@ class Adjoint:
 
         name = builtin_operators[type(node.op)]
 
+        try:
+            # Check if there is any user-defined overload for this operator
+            user_func = adj.resolve_external_reference(name)
+            if isinstance(user_func, warp.context.Function):
+                return adj.add_call(user_func, (left, right), {}, {})
+        except WarpCodegenError:
+            pass
+
         return adj.add_builtin_call(name, [left, right])
 
     def emit_UnaryOp(adj, node):
         # evaluate unary op arguments
         arg = adj.eval(node.operand)
+
+        # evaluate expression to a compile-time constant if arg is a constant
+        if arg.constant is not None and math.isfinite(arg.constant):
+            if isinstance(node.op, ast.USub):
+                return adj.add_constant(-arg.constant)
 
         name = builtin_operators[type(node.op)]
 
@@ -2361,12 +2384,16 @@ class Adjoint:
                     out.is_write = target.is_write
 
         elif is_tile(target_type):
-            if len(indices) == 2:
+            if len(indices) == len(target_type.shape):
                 # handles extracting a single element from a tile
                 out = adj.add_builtin_call("tile_extract", [target, *indices])
-            else:
+            elif len(indices) < len(target_type.shape):
                 # handles tile views
-                out = adj.add_builtin_call("tile_view", [target, *indices])
+                out = adj.add_builtin_call("tile_view", [target, indices])
+            else:
+                raise RuntimeError(
+                    f"Incorrect number of indices specified for a tile view/extract, got {len(indices)} indices for a {len(target_type.shape)} dimensional tile."
+                )
 
         else:
             # handles non-array type indexing, e.g: vec3, mat33, etc
@@ -2458,6 +2485,9 @@ class Adjoint:
 
                     target.mark_write(kernel_name=kernel_name, filename=filename, lineno=lineno)
 
+            elif is_tile(target_type):
+                adj.add_builtin_call("assign", [target, *indices, rhs])
+
             elif type_is_vector(target_type) or type_is_quaternion(target_type) or type_is_matrix(target_type):
                 # recursively unwind AST, stopping at penultimate node
                 node = lhs
@@ -2484,15 +2514,17 @@ class Adjoint:
                         print(
                             f"Warning: mutating {node_source} in function {adj.fun_name} at {adj.filename}:{lineno}: this is a non-differentiable operation.\n{line}\n"
                         )
-
                 else:
-                    out = adj.add_builtin_call("assign", [target, *indices, rhs])
+                    if warp.config.enable_vector_component_overwrites:
+                        out = adj.add_builtin_call("assign_copy", [target, *indices, rhs])
 
-                    # re-point target symbol to out var
-                    for id in adj.symbols:
-                        if adj.symbols[id] == target:
-                            adj.symbols[id] = out
-                            break
+                        # re-point target symbol to out var
+                        for id in adj.symbols:
+                            if adj.symbols[id] == target:
+                                adj.symbols[id] = out
+                                break
+                    else:
+                        adj.add_builtin_call("assign_inplace", [target, *indices, rhs])
 
             else:
                 raise WarpCodegenError(
@@ -2529,22 +2561,22 @@ class Adjoint:
 
             # assigning to a vector or quaternion component
             if type_is_vector(aggregate_type) or type_is_quaternion(aggregate_type):
-                # TODO: handle wp.adjoint case
-
                 index = adj.vector_component_index(lhs.attr, aggregate_type)
 
-                # TODO: array vec component case
                 if is_reference(aggregate.type):
                     attr = adj.add_builtin_call("indexref", [aggregate, index])
                     adj.add_builtin_call("store", [attr, rhs])
                 else:
-                    out = adj.add_builtin_call("assign", [aggregate, index, rhs])
+                    if warp.config.enable_vector_component_overwrites:
+                        out = adj.add_builtin_call("assign_copy", [aggregate, index, rhs])
 
-                    # re-point target symbol to out var
-                    for id in adj.symbols:
-                        if adj.symbols[id] == aggregate:
-                            adj.symbols[id] = out
-                            break
+                        # re-point target symbol to out var
+                        for id in adj.symbols:
+                            if adj.symbols[id] == aggregate:
+                                adj.symbols[id] = out
+                                break
+                    else:
+                        adj.add_builtin_call("assign_inplace", [aggregate, index, rhs])
 
             else:
                 attr = adj.emit_Attribute(lhs)
@@ -2648,10 +2680,16 @@ class Adjoint:
                     make_new_assign_statement()
                     return
 
-            # TODO
             elif type_is_vector(target_type) or type_is_quaternion(target_type) or type_is_matrix(target_type):
-                make_new_assign_statement()
-                return
+                if isinstance(node.op, ast.Add):
+                    adj.add_builtin_call("add_inplace", [target, *indices, rhs])
+                elif isinstance(node.op, ast.Sub):
+                    adj.add_builtin_call("sub_inplace", [target, *indices, rhs])
+                else:
+                    if warp.config.verbose:
+                        print(f"Warning: in-place op {node.op} is not differentiable")
+                    make_new_assign_statement()
+                    return
 
             else:
                 raise WarpCodegenError("Can only subscript in-place assign array, vector, quaternion, and matrix types")
@@ -2862,10 +2900,61 @@ class Adjoint:
         if static_code is None:
             raise WarpCodegenError("Error extracting source code from wp.static() expression")
 
+        # Since this is an expression, we can enforce it to be defined on a single line.
+        static_code = static_code.replace("\n", "")
+
         vars_dict = adj.get_static_evaluation_context()
         # add constant variables to the static call context
         constant_vars = {k: v.constant for k, v in adj.symbols.items() if isinstance(v, Var) and v.constant is not None}
         vars_dict.update(constant_vars)
+
+        # Replace all constant `len()` expressions with their value.
+        if "len" in static_code:
+
+            def eval_len(obj):
+                if type_is_vector(obj):
+                    return obj._length_
+                elif type_is_quaternion(obj):
+                    return obj._length_
+                elif type_is_matrix(obj):
+                    return obj._shape_[0]
+                elif type_is_transformation(obj):
+                    return obj._length_
+                elif is_tile(obj):
+                    return obj.shape[0]
+
+                return len(obj)
+
+            len_expr_ctx = vars_dict.copy()
+            constant_types = {k: v.type for k, v in adj.symbols.items() if isinstance(v, Var) and v.type is not None}
+            len_expr_ctx.update(constant_types)
+            len_expr_ctx.update({"len": eval_len})
+
+            # We want to replace the expression code in-place,
+            # so reparse it to get the correct column info.
+            len_value_locs = []
+            expr_tree = ast.parse(static_code)
+            assert len(expr_tree.body) == 1 and isinstance(expr_tree.body[0], ast.Expr)
+            expr_root = expr_tree.body[0].value
+            for expr_node in ast.walk(expr_root):
+                if isinstance(expr_node, ast.Call) and expr_node.func.id == "len" and len(expr_node.args) == 1:
+                    len_expr = static_code[expr_node.col_offset : expr_node.end_col_offset]
+                    try:
+                        len_value = eval(len_expr, len_expr_ctx)
+                    except Exception:
+                        pass
+                    else:
+                        len_value_locs.append((len_value, expr_node.col_offset, expr_node.end_col_offset))
+
+            if len_value_locs:
+                new_static_code = ""
+                loc = 0
+                for value, start, end in len_value_locs:
+                    new_static_code += f"{static_code[loc:start]}{value}"
+                    loc = end
+
+                new_static_code += static_code[len_value_locs[-1][2] :]
+                static_code = new_static_code
 
         try:
             value = eval(static_code, vars_dict)
@@ -3151,7 +3240,7 @@ static CUDA_CALLABLE void adj_{name}(
 
 """
 
-cuda_kernel_template = """
+cuda_kernel_template_forward = """
 
 extern "C" __global__ void {name}_cuda_kernel_forward(
     {forward_args})
@@ -3165,6 +3254,10 @@ extern "C" __global__ void {name}_cuda_kernel_forward(
 
 {forward_body}    }}
 }}
+
+"""
+
+cuda_kernel_template_backward = """
 
 extern "C" __global__ void {name}_cuda_kernel_backward(
     {reverse_args})
@@ -3181,12 +3274,16 @@ extern "C" __global__ void {name}_cuda_kernel_backward(
 
 """
 
-cpu_kernel_template = """
+cpu_kernel_template_forward = """
 
 void {name}_cpu_kernel_forward(
     {forward_args})
 {{
 {forward_body}}}
+
+"""
+
+cpu_kernel_template_backward = """
 
 void {name}_cpu_kernel_backward(
     {reverse_args})
@@ -3195,7 +3292,7 @@ void {name}_cpu_kernel_backward(
 
 """
 
-cpu_module_template = """
+cpu_module_template_forward = """
 
 extern "C" {{
 
@@ -3210,6 +3307,14 @@ WP_API void {name}_cpu_forward(
     }}
 }}
 
+}} // extern C
+
+"""
+
+cpu_module_template_backward = """
+
+extern "C" {{
+
 WP_API void {name}_cpu_backward(
     {reverse_args})
 {{
@@ -3222,36 +3327,6 @@ WP_API void {name}_cpu_backward(
 
 }} // extern C
 
-"""
-
-cuda_module_header_template = """
-
-extern "C" {{
-
-// Python CUDA entry points
-WP_API void {name}_cuda_forward(
-    void* stream,
-    {forward_args});
-
-WP_API void {name}_cuda_backward(
-    void* stream,
-    {reverse_args});
-
-}} // extern C
-"""
-
-cpu_module_header_template = """
-
-extern "C" {{
-
-// Python CPU entry points
-WP_API void {name}_cpu_forward(
-    {forward_args});
-
-WP_API void {name}_cpu_backward(
-    {reverse_args});
-
-}} // extern C
 """
 
 
@@ -3691,58 +3766,81 @@ def codegen_kernel(kernel, device, options):
 
     adj = kernel.adj
 
-    forward_args = ["wp::launch_bounds_t dim"]
-    reverse_args = ["wp::launch_bounds_t dim"]
-
     if device == "cpu":
-        forward_args.append("size_t task_index")
-        reverse_args.append("size_t task_index")
-
-    # forward args
-    for arg in adj.args:
-        forward_args.append(arg.ctype() + " var_" + arg.label)
-        reverse_args.append(arg.ctype() + " var_" + arg.label)
-
-    # reverse args
-    for arg in adj.args:
-        # indexed array gradients are regular arrays
-        if isinstance(arg.type, indexedarray):
-            _arg = Var(arg.label, array(dtype=arg.type.dtype, ndim=arg.type.ndim))
-            reverse_args.append(_arg.ctype() + " adj_" + arg.label)
-        else:
-            reverse_args.append(arg.ctype() + " adj_" + arg.label)
-
-    # codegen body
-    forward_body = codegen_func_forward(adj, func_type="kernel", device=device)
-
-    if options["enable_backward"]:
-        reverse_body = codegen_func_reverse(adj, func_type="kernel", device=device)
-    else:
-        reverse_body = ""
-
-    if device == "cpu":
-        template = cpu_kernel_template
+        template_forward = cpu_kernel_template_forward
+        template_backward = cpu_kernel_template_backward
     elif device == "cuda":
-        template = cuda_kernel_template
+        template_forward = cuda_kernel_template_forward
+        template_backward = cuda_kernel_template_backward
     else:
         raise ValueError(f"Device {device} is not supported")
 
-    s = template.format(
-        name=kernel.get_mangled_name(),
-        forward_args=indent(forward_args),
-        reverse_args=indent(reverse_args),
-        forward_body=forward_body,
-        reverse_body=reverse_body,
-    )
+    template = ""
+    template_fmt_args = {
+        "name": kernel.get_mangled_name(),
+    }
 
+    # build forward signature
+    forward_args = ["wp::launch_bounds_t dim"]
+    if device == "cpu":
+        forward_args.append("size_t task_index")
+
+    for arg in adj.args:
+        forward_args.append(arg.ctype() + " var_" + arg.label)
+
+    forward_body = codegen_func_forward(adj, func_type="kernel", device=device)
+    template_fmt_args.update(
+        {
+            "forward_args": indent(forward_args),
+            "forward_body": forward_body,
+        }
+    )
+    template += template_forward
+
+    if options["enable_backward"]:
+        # build reverse signature
+        reverse_args = ["wp::launch_bounds_t dim"]
+        if device == "cpu":
+            reverse_args.append("size_t task_index")
+
+        for arg in adj.args:
+            reverse_args.append(arg.ctype() + " var_" + arg.label)
+
+        for arg in adj.args:
+            # indexed array gradients are regular arrays
+            if isinstance(arg.type, indexedarray):
+                _arg = Var(arg.label, array(dtype=arg.type.dtype, ndim=arg.type.ndim))
+                reverse_args.append(_arg.ctype() + " adj_" + arg.label)
+            else:
+                reverse_args.append(arg.ctype() + " adj_" + arg.label)
+
+        reverse_body = codegen_func_reverse(adj, func_type="kernel", device=device)
+        template_fmt_args.update(
+            {
+                "reverse_args": indent(reverse_args),
+                "reverse_body": reverse_body,
+            }
+        )
+        template += template_backward
+
+    s = template.format(**template_fmt_args)
     return s
 
 
-def codegen_module(kernel, device="cpu"):
+def codegen_module(kernel, device, options):
     if device != "cpu":
         return ""
 
+    # Update the module's options with the ones defined on the kernel, if any.
+    options = dict(options)
+    options.update(kernel.options)
+
     adj = kernel.adj
+
+    template = ""
+    template_fmt_args = {
+        "name": kernel.get_mangled_name(),
+    }
 
     # build forward signature
     forward_args = ["wp::launch_bounds_t dim"]
@@ -3757,29 +3855,40 @@ def codegen_module(kernel, device="cpu"):
             forward_args.append(f"{arg.ctype()} var_{arg.label}")
             forward_params.append("var_" + arg.label)
 
-    # build reverse signature
-    reverse_args = [*forward_args]
-    reverse_params = [*forward_params]
-
-    for arg in adj.args:
-        if isinstance(arg.type, indexedarray):
-            # indexed array gradients are regular arrays
-            _arg = Var(arg.label, array(dtype=arg.type.dtype, ndim=arg.type.ndim))
-            reverse_args.append(f"const {_arg.ctype()} adj_{arg.label}")
-            reverse_params.append(f"adj_{_arg.label}")
-        elif hasattr(arg.type, "_wp_generic_type_str_"):
-            # vectors and matrices are passed from Python by pointer
-            reverse_args.append(f"const {arg.ctype()}* adj_{arg.label}")
-            reverse_params.append(f"*adj_{arg.label}")
-        else:
-            reverse_args.append(f"{arg.ctype()} adj_{arg.label}")
-            reverse_params.append(f"adj_{arg.label}")
-
-    s = cpu_module_template.format(
-        name=kernel.get_mangled_name(),
-        forward_args=indent(forward_args),
-        reverse_args=indent(reverse_args),
-        forward_params=indent(forward_params, 3),
-        reverse_params=indent(reverse_params, 3),
+    template_fmt_args.update(
+        {
+            "forward_args": indent(forward_args),
+            "forward_params": indent(forward_params, 3),
+        }
     )
+    template += cpu_module_template_forward
+
+    if options["enable_backward"]:
+        # build reverse signature
+        reverse_args = [*forward_args]
+        reverse_params = [*forward_params]
+
+        for arg in adj.args:
+            if isinstance(arg.type, indexedarray):
+                # indexed array gradients are regular arrays
+                _arg = Var(arg.label, array(dtype=arg.type.dtype, ndim=arg.type.ndim))
+                reverse_args.append(f"const {_arg.ctype()} adj_{arg.label}")
+                reverse_params.append(f"adj_{_arg.label}")
+            elif hasattr(arg.type, "_wp_generic_type_str_"):
+                # vectors and matrices are passed from Python by pointer
+                reverse_args.append(f"const {arg.ctype()}* adj_{arg.label}")
+                reverse_params.append(f"*adj_{arg.label}")
+            else:
+                reverse_args.append(f"{arg.ctype()} adj_{arg.label}")
+                reverse_params.append(f"adj_{arg.label}")
+
+        template_fmt_args.update(
+            {
+                "reverse_args": indent(reverse_args),
+                "reverse_params": indent(reverse_params, 3),
+            }
+        )
+        template += cpu_module_template_backward
+
+    s = template.format(**template_fmt_args)
     return s

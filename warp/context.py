@@ -5,8 +5,11 @@
 # distribution of this software and related documentation without an express
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
+from __future__ import annotations
+
 import ast
 import ctypes
+import errno
 import functools
 import hashlib
 import inspect
@@ -17,6 +20,7 @@ import operator
 import os
 import platform
 import sys
+import time
 import types
 import typing
 import weakref
@@ -391,7 +395,8 @@ class Function:
             if not warp.codegen.func_match_args(f, arg_types, kwarg_types):
                 continue
 
-            if len(f.input_types) != len(arg_types):
+            acceptable_arg_num = len(f.input_types) - len(f.defaults) <= len(arg_types) <= len(f.input_types)
+            if not acceptable_arg_num:
                 continue
 
             # try to match the given types to the function template types
@@ -408,6 +413,10 @@ class Function:
 
                 arg_names = f.input_types.keys()
                 overload_annotations = dict(zip(arg_names, arg_types))
+                # add defaults
+                for k, d in f.defaults.items():
+                    if k not in overload_annotations:
+                        overload_annotations[k] = warp.codegen.strip_reference(warp.codegen.get_arg_type(d))
 
                 ovl = shallowcopy(f)
                 ovl.adj = warp.codegen.Adjoint(f.func, overload_annotations)
@@ -751,8 +760,15 @@ def func(f):
     scope_locals = inspect.currentframe().f_back.f_locals
 
     m = get_module(f.__module__)
+    doc = getattr(f, "__doc__", "") or ""
     Function(
-        func=f, key=name, namespace="", module=m, value_func=None, scope_locals=scope_locals
+        func=f,
+        key=name,
+        namespace="",
+        module=m,
+        value_func=None,
+        scope_locals=scope_locals,
+        doc=doc.strip(),
     )  # value_type not known yet, will be inferred during Adjoint.build()
 
     # use the top of the list of overloads for this key
@@ -1057,7 +1073,8 @@ def overload(kernel, arg_types=Union[None, Dict[str, Any], List[Any]]):
         raise RuntimeError("wp.overload() called with invalid argument!")
 
 
-builtin_functions = {}
+# native functions that are part of the Warp API
+builtin_functions: Dict[str, Function] = {}
 
 
 def get_generic_vtypes():
@@ -1326,6 +1343,28 @@ def add_builtin(
             setattr(warp, key, func)
 
 
+def register_api_function(
+    function: Function,
+    group: str = "Other",
+    hidden=False,
+):
+    """Main entry point to register a Warp Python function to be part of the Warp API and appear in the documentation.
+
+    Args:
+        function (Function): Warp function to be registered.
+        group (str): Classification used for the documentation.
+        input_types (Mapping[str, Any]): Signature of the user-facing function.
+            Variadic arguments are supported by prefixing the parameter names
+            with asterisks as in `*args` and `**kwargs`. Generic arguments are
+            supported with types such as `Any`, `Float`, `Scalar`, etc.
+        value_type (Any): Type returned by the function.
+        hidden (bool): Whether to add that function into the documentation.
+    """
+    function.group = group
+    function.hidden = hidden
+    builtin_functions[function.key] = function
+
+
 # global dictionary of modules
 user_modules = {}
 
@@ -1559,6 +1598,7 @@ class ModuleBuilder:
         self.options = options
         self.module = module
         self.deferred_functions = []
+        self.fatbins = {}  # map from <some identifier> to fatbins, to add at link time
         self.ltoirs = {}  # map from lto symbol to lto binary
         self.ltoirs_decl = {}  # map from lto symbol to lto forward declaration
 
@@ -1673,7 +1713,7 @@ class ModuleBuilder:
 
         for kernel in self.kernels:
             source += warp.codegen.codegen_kernel(kernel, device=device, options=self.options)
-            source += warp.codegen.codegen_module(kernel, device=device)
+            source += warp.codegen.codegen_module(kernel, device=device, options=self.options)
 
         # add headers
         if device == "cpu":
@@ -1726,20 +1766,26 @@ class ModuleExec:
 
         name = kernel.get_mangled_name()
 
+        options = dict(kernel.module.options)
+        options.update(kernel.options)
+
         if self.device.is_cuda:
             forward_name = name + "_cuda_kernel_forward"
             forward_kernel = runtime.core.cuda_get_kernel(
                 self.device.context, self.handle, forward_name.encode("utf-8")
             )
 
-            backward_name = name + "_cuda_kernel_backward"
-            backward_kernel = runtime.core.cuda_get_kernel(
-                self.device.context, self.handle, backward_name.encode("utf-8")
-            )
+            if options["enable_backward"]:
+                backward_name = name + "_cuda_kernel_backward"
+                backward_kernel = runtime.core.cuda_get_kernel(
+                    self.device.context, self.handle, backward_name.encode("utf-8")
+                )
+            else:
+                backward_kernel = None
 
             # look up the required shared memory size for each kernel from module metadata
             forward_smem_bytes = self.meta[forward_name + "_smem_bytes"]
-            backward_smem_bytes = self.meta[backward_name + "_smem_bytes"]
+            backward_smem_bytes = self.meta[backward_name + "_smem_bytes"] if options["enable_backward"] else 0
 
             # configure kernels maximum shared memory size
             max_smem_bytes = runtime.core.cuda_get_max_shared_memory(self.device.context)
@@ -1748,9 +1794,6 @@ class ModuleExec:
                 print(
                     f"Warning: Failed to configure kernel dynamic shared memory for this device, tried to configure {forward_name} kernel for {forward_smem_bytes} bytes, but maximum available is {max_smem_bytes}"
                 )
-
-            options = dict(kernel.module.options)
-            options.update(kernel.options)
 
             if options["enable_backward"] and not runtime.core.cuda_configure_kernel_shared_memory(
                 backward_kernel, backward_smem_bytes
@@ -1766,9 +1809,14 @@ class ModuleExec:
             forward = (
                 func(runtime.llvm.lookup(self.handle.encode("utf-8"), (name + "_cpu_forward").encode("utf-8"))) or None
             )
-            backward = (
-                func(runtime.llvm.lookup(self.handle.encode("utf-8"), (name + "_cpu_backward").encode("utf-8"))) or None
-            )
+
+            if options["enable_backward"]:
+                backward = (
+                    func(runtime.llvm.lookup(self.handle.encode("utf-8"), (name + "_cpu_backward").encode("utf-8")))
+                    or None
+                )
+            else:
+                backward = None
 
             hooks = KernelHooks(forward, backward)
 
@@ -1801,13 +1849,13 @@ class Module:
         self._live_kernels = weakref.WeakSet()
 
         # executable modules currently loaded
-        self.execs = {}  # (device.context: ModuleExec)
+        self.execs = {}  # ((device.context, blockdim): ModuleExec)
 
         # set of device contexts where the build has failed
         self.failed_builds = set()
 
-        # hash data, including the module hash
-        self.hasher = None
+        # hash data, including the module hash. Module may store multiple hashes (one per block_dim used)
+        self.hashers = {}
 
         # LLVM executable modules are identified using strings.  Since it's possible for multiple
         # executable versions to be loaded at the same time, we need a way to ensure uniqueness.
@@ -1820,6 +1868,8 @@ class Module:
             "max_unroll": warp.config.max_unroll,
             "enable_backward": warp.config.enable_backward,
             "fast_math": False,
+            "fuse_fp": True,
+            "lineinfo": False,
             "cuda_output": None,  # supported values: "ptx", "cubin", or None (automatic)
             "mode": warp.config.mode,
             "block_dim": 256,
@@ -1963,28 +2013,27 @@ class Module:
 
     def hash_module(self):
         # compute latest hash
-        self.hasher = ModuleHasher(self)
-        return self.hasher.get_module_hash()
+        block_dim = self.options["block_dim"]
+        self.hashers[block_dim] = ModuleHasher(self)
+        return self.hashers[block_dim].get_module_hash()
 
     def load(self, device, block_dim=None) -> ModuleExec:
         device = runtime.get_device(device)
 
-        # re-compile module if tile size (blockdim) changes
-        # todo: it would be better to have a method such as `module.get_kernel(block_dim=N)`
-        # that can return a single kernel instance with a given block size
+        # update module options if launching with a new block dim
         if block_dim is not None:
-            if self.options["block_dim"] != block_dim:
-                self.unload()
             self.options["block_dim"] = block_dim
 
+        active_block_dim = self.options["block_dim"]
+
         # compute the hash if needed
-        if self.hasher is None:
-            self.hasher = ModuleHasher(self)
+        if active_block_dim not in self.hashers:
+            self.hashers[active_block_dim] = ModuleHasher(self)
 
         # check if executable module is already loaded and not stale
-        exec = self.execs.get(device.context)
+        exec = self.execs.get((device.context, active_block_dim))
         if exec is not None:
-            if exec.module_hash == self.hasher.module_hash:
+            if exec.module_hash == self.hashers[active_block_dim].get_module_hash():
                 return exec
 
         # quietly avoid repeated build attempts to reduce error spew
@@ -1992,10 +2041,11 @@ class Module:
             return None
 
         module_name = "wp_" + self.name
-        module_hash = self.hasher.module_hash
+        module_hash = self.hashers[active_block_dim].get_module_hash()
 
         # use a unique module path using the module short hash
-        module_dir = os.path.join(warp.config.kernel_cache_dir, f"{module_name}_{module_hash.hex()[:7]}")
+        module_name_short = f"{module_name}_{module_hash.hex()[:7]}"
+        module_dir = os.path.join(warp.config.kernel_cache_dir, module_name_short)
 
         with warp.ScopedTimer(
             f"Module {self.name} {module_hash.hex()[:7]} load on device '{device}'", active=not warp.config.quiet
@@ -2003,7 +2053,7 @@ class Module:
             # -----------------------------------------------------------
             # determine output paths
             if device.is_cpu:
-                output_name = "module_codegen.o"
+                output_name = f"{module_name_short}.o"
                 output_arch = None
 
             elif device.is_cuda:
@@ -2023,10 +2073,10 @@ class Module:
 
                 if use_ptx:
                     output_arch = min(device.arch, warp.config.ptx_target_arch)
-                    output_name = f"module_codegen.sm{output_arch}.ptx"
+                    output_name = f"{module_name_short}.sm{output_arch}.ptx"
                 else:
                     output_arch = device.arch
-                    output_name = f"module_codegen.sm{output_arch}.cubin"
+                    output_name = f"{module_name_short}.sm{output_arch}.cubin"
 
             # final object binary path
             binary_path = os.path.join(module_dir, output_name)
@@ -2048,7 +2098,7 @@ class Module:
                     # Some of the Tile codegen, such as cuFFTDx and cuBLASDx, requires knowledge of the target arch
                     "output_arch": output_arch,
                 }
-                builder = ModuleBuilder(self, builder_options, hasher=self.hasher)
+                builder = ModuleBuilder(self, builder_options, hasher=self.hashers[active_block_dim])
 
                 # create a temporary (process unique) dir for build outputs before moving to the binary dir
                 build_dir = os.path.join(
@@ -2064,7 +2114,7 @@ class Module:
                 if device.is_cpu:
                     # build
                     try:
-                        source_code_path = os.path.join(build_dir, "module_codegen.cpp")
+                        source_code_path = os.path.join(build_dir, f"{module_name_short}.cpp")
 
                         # write cpp sources
                         cpp_source = builder.codegen("cpu")
@@ -2082,6 +2132,7 @@ class Module:
                                 mode=self.options["mode"],
                                 fast_math=self.options["fast_math"],
                                 verify_fp=warp.config.verify_fp,
+                                fuse_fp=self.options["fuse_fp"],
                             )
 
                     except Exception as e:
@@ -2092,7 +2143,7 @@ class Module:
                 elif device.is_cuda:
                     # build
                     try:
-                        source_code_path = os.path.join(build_dir, "module_codegen.cu")
+                        source_code_path = os.path.join(build_dir, f"{module_name_short}.cu")
 
                         # write cuda sources
                         cu_source = builder.codegen("cuda")
@@ -2109,9 +2160,12 @@ class Module:
                                 output_arch,
                                 output_path,
                                 config=self.options["mode"],
-                                fast_math=self.options["fast_math"],
                                 verify_fp=warp.config.verify_fp,
+                                fast_math=self.options["fast_math"],
+                                fuse_fp=self.options["fuse_fp"],
+                                lineinfo=self.options["lineinfo"],
                                 ltoirs=builder.ltoirs.values(),
+                                fatbins=builder.fatbins.values(),
                             )
 
                     except Exception as e:
@@ -2123,7 +2177,7 @@ class Module:
                 # build meta data
 
                 meta = builder.build_meta()
-                meta_path = os.path.join(build_dir, "module_codegen.meta")
+                meta_path = os.path.join(build_dir, f"{module_name_short}.meta")
 
                 with open(meta_path, "w") as meta_file:
                     json.dump(meta, meta_file)
@@ -2131,12 +2185,34 @@ class Module:
                 # -----------------------------------------------------------
                 # update cache
 
-                try:
-                    # Copy process-specific build directory to a process-independent location
-                    os.rename(build_dir, module_dir)
-                except (OSError, FileExistsError):
-                    # another process likely updated the module dir first
-                    pass
+                def safe_rename(src, dst, attempts=5, delay=0.1):
+                    for i in range(attempts):
+                        try:
+                            os.rename(src, dst)
+                            return
+                        except FileExistsError:
+                            return
+                        except OSError as e:
+                            if e.errno == errno.ENOTEMPTY:
+                                # if directory exists we assume another process
+                                # got there first, in which case we will copy
+                                # our output to the directory manually in second step
+                                return
+                            else:
+                                # otherwise assume directory creation failed e.g.: access denied
+                                # on Windows we see occasional failures to rename directories due to
+                                # some process holding a lock on a file to be moved to workaround
+                                # this we make multiple attempts to rename with some delay
+                                if i < attempts - 1:
+                                    time.sleep(delay)
+                                else:
+                                    print(
+                                        f"Could not update Warp cache with module binaries, trying to rename {build_dir} to {module_dir}, error {e}"
+                                    )
+                                    raise e
+
+                # try to move process outputs to cache
+                safe_rename(build_dir, module_dir)
 
                 if os.path.exists(module_dir):
                     if not os.path.exists(binary_path):
@@ -2165,7 +2241,7 @@ class Module:
             # -----------------------------------------------------------
             # Load CPU or CUDA binary
 
-            meta_path = os.path.join(module_dir, "module_codegen.meta")
+            meta_path = os.path.join(module_dir, f"{module_name_short}.meta")
             with open(meta_path, "r") as meta_file:
                 meta = json.load(meta_file)
 
@@ -2175,13 +2251,13 @@ class Module:
                 self.cpu_exec_id += 1
                 runtime.llvm.load_obj(binary_path.encode("utf-8"), module_handle.encode("utf-8"))
                 module_exec = ModuleExec(module_handle, module_hash, device, meta)
-                self.execs[None] = module_exec
+                self.execs[(None, active_block_dim)] = module_exec
 
             elif device.is_cuda:
                 cuda_module = warp.build.load_cuda(binary_path, device)
                 if cuda_module is not None:
                     module_exec = ModuleExec(cuda_module, module_hash, device, meta)
-                    self.execs[device.context] = module_exec
+                    self.execs[(device.context, active_block_dim)] = module_exec
                 else:
                     module_load_timer.extra_msg = " (error)"
                     raise Exception(f"Failed to load CUDA module '{self.name}'")
@@ -2203,14 +2279,14 @@ class Module:
 
     def mark_modified(self):
         # clear hash data
-        self.hasher = None
+        self.hashers = {}
 
         # clear build failures
         self.failed_builds = set()
 
     # lookup kernel entry points based on name, called after compilation / module load
     def get_kernel_hooks(self, kernel, device):
-        module_exec = self.execs.get(device.context)
+        module_exec = self.execs.get((device.context, self.options["block_dim"]))
         if module_exec is not None:
             return module_exec.get_kernel_hooks(kernel)
         else:
@@ -2329,6 +2405,7 @@ class Event:
         DEFAULT = 0x0
         BLOCKING_SYNC = 0x1
         DISABLE_TIMING = 0x2
+        INTERPROCESS = 0x4
 
     def __new__(cls, *args, **kwargs):
         """Creates a new event instance."""
@@ -2336,7 +2413,9 @@ class Event:
         instance.owner = False
         return instance
 
-    def __init__(self, device: "Devicelike" = None, cuda_event=None, enable_timing: bool = False):
+    def __init__(
+        self, device: "Devicelike" = None, cuda_event=None, enable_timing: bool = False, interprocess: bool = False
+    ):
         """Initializes the event on a CUDA device.
 
         Args:
@@ -2348,6 +2427,12 @@ class Event:
               :func:`~warp.get_event_elapsed_time` can be used to measure the
               time between two events created with ``enable_timing=True`` and
               recorded onto streams.
+            interprocess: If ``True`` this event may be used as an interprocess event.
+
+        Raises:
+            RuntimeError: The event could not be created.
+            ValueError: The combination of ``enable_timing=True`` and
+                ``interprocess=True`` is not allowed.
         """
 
         device = get_device(device)
@@ -2362,10 +2447,47 @@ class Event:
             flags = Event.Flags.DEFAULT
             if not enable_timing:
                 flags |= Event.Flags.DISABLE_TIMING
+            if interprocess:
+                if enable_timing:
+                    raise ValueError("The combination of 'enable_timing=True' and 'interprocess=True' is not allowed.")
+                flags |= Event.Flags.INTERPROCESS
+
             self.cuda_event = runtime.core.cuda_event_create(device.context, flags)
             if not self.cuda_event:
                 raise RuntimeError(f"Failed to create event on device {device}")
             self.owner = True
+
+    def ipc_handle(self) -> bytes:
+        """Return a CUDA IPC handle of the event as a 64-byte ``bytes`` object.
+
+        The event must have been created with ``interprocess=True`` in order to
+        obtain a valid interprocess handle.
+
+        IPC is currently only supported on Linux.
+
+        Example:
+            Create an event and get its IPC handle::
+
+                e1 = wp.Event(interprocess=True)
+                event_handle = e1.ipc_handle()
+
+        Raises:
+            RuntimeError: Device does not support IPC.
+        """
+
+        if self.device.is_ipc_supported is not False:
+            # Allocate a buffer for the data (64-element char array)
+            ipc_handle_buffer = (ctypes.c_char * 64)()
+
+            warp.context.runtime.core.cuda_ipc_get_event_handle(self.device.context, self.cuda_event, ipc_handle_buffer)
+
+            if ipc_handle_buffer.raw == bytes(64):
+                warp.utils.warn("IPC event handle appears to be invalid. Was interprocess=True used?")
+
+            return ipc_handle_buffer.raw
+
+        else:
+            raise RuntimeError(f"Device {self.device} does not support IPC.")
 
     def __del__(self):
         if not self.owner:
@@ -2397,7 +2519,7 @@ class Stream:
         Raises:
             RuntimeError: If function is called before Warp has completed
               initialization with a ``device`` that is not an instance of
-              :class:`Device``.
+              :class:`Device <warp.context.Device>`.
             RuntimeError: ``device`` is not a CUDA Device.
             RuntimeError: The stream could not be created on the device.
             TypeError: The requested stream priority is not an integer.
@@ -2514,23 +2636,27 @@ class Device:
     """A device to allocate Warp arrays and to launch kernels on.
 
     Attributes:
-        ordinal: A Warp-specific integer label for the device. ``-1`` for CPU devices.
-        name: A string label for the device. By default, CPU devices will be named according to the processor name,
+        ordinal (int): A Warp-specific label for the device. ``-1`` for CPU devices.
+        name (str): A label for the device. By default, CPU devices will be named according to the processor name,
             or ``"CPU"`` if the processor name cannot be determined.
-        arch: An integer representing the compute capability version number calculated as
-            ``10 * major + minor``. ``0`` for CPU devices.
-        is_uva: A boolean indicating whether the device supports unified addressing.
+        arch (int): The compute capability version number calculated as ``10 * major + minor``.
+            ``0`` for CPU devices.
+        is_uva (bool): Indicates whether the device supports unified addressing.
             ``False`` for CPU devices.
-        is_cubin_supported: A boolean indicating whether Warp's version of NVRTC can directly
+        is_cubin_supported (bool): Indicates whether Warp's version of NVRTC can directly
             generate CUDA binary files (cubin) for this device's architecture. ``False`` for CPU devices.
-        is_mempool_supported: A boolean indicating whether the device supports using the
-            ``cuMemAllocAsync`` and ``cuMemPool`` family of APIs for stream-ordered memory allocations. ``False`` for
-            CPU devices.
-        is_primary: A boolean indicating whether this device's CUDA context is also the
-            device's primary context.
-        uuid: A string representing the UUID of the CUDA device. The UUID is in the same format used by
-            ``nvidia-smi -L``. ``None`` for CPU devices.
-        pci_bus_id: A string identifier for the CUDA device in the format ``[domain]:[bus]:[device]``, in which
+        is_mempool_supported (bool): Indicates whether the device supports using the ``cuMemAllocAsync`` and
+            ``cuMemPool`` family of APIs for stream-ordered memory allocations. ``False`` for CPU devices.
+        is_ipc_supported (Optional[bool]): Indicates whether the device supports IPC.
+
+            - ``True`` if supported.
+            - ``False`` if not supported.
+            - ``None`` if IPC support could not be determined (e.g. CUDA 11).
+
+        is_primary (bool): Indicates whether this device's CUDA context is also the device's primary context.
+        uuid (str): The UUID of the CUDA device. The UUID is in the same format used by ``nvidia-smi -L``.
+            ``None`` for CPU devices.
+        pci_bus_id (str): An identifier for the CUDA device in the format ``[domain]:[bus]:[device]``, in which
             ``domain``, ``bus``, and ``device`` are all hexadecimal values. ``None`` for CPU devices.
     """
 
@@ -2563,6 +2689,7 @@ class Device:
             self.is_uva = False
             self.is_mempool_supported = False
             self.is_mempool_enabled = False
+            self.is_ipc_supported = False  # TODO: Support IPC for CPU arrays
             self.is_cubin_supported = False
             self.uuid = None
             self.pci_bus_id = None
@@ -2578,8 +2705,14 @@ class Device:
             # CUDA device
             self.name = runtime.core.cuda_device_get_name(ordinal).decode()
             self.arch = runtime.core.cuda_device_get_arch(ordinal)
-            self.is_uva = runtime.core.cuda_device_is_uva(ordinal)
-            self.is_mempool_supported = runtime.core.cuda_device_is_mempool_supported(ordinal)
+            self.is_uva = runtime.core.cuda_device_is_uva(ordinal) > 0
+            self.is_mempool_supported = runtime.core.cuda_device_is_mempool_supported(ordinal) > 0
+            if platform.system() == "Linux":
+                # Use None when IPC support cannot be determined
+                ipc_support_api_query = runtime.core.cuda_device_is_ipc_supported(ordinal)
+                self.is_ipc_supported = bool(ipc_support_api_query) if ipc_support_api_query >= 0 else None
+            else:
+                self.is_ipc_supported = False
             if warp.config.enable_mempools_at_init:
                 # enable if supported
                 self.is_mempool_enabled = self.is_mempool_supported
@@ -3079,10 +3212,16 @@ class Runtime:
             ]
 
             self.core.bvh_create_host.restype = ctypes.c_uint64
-            self.core.bvh_create_host.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
+            self.core.bvh_create_host.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
 
             self.core.bvh_create_device.restype = ctypes.c_uint64
-            self.core.bvh_create_device.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
+            self.core.bvh_create_device.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.c_int,
+            ]
 
             self.core.bvh_destroy_host.argtypes = [ctypes.c_uint64]
             self.core.bvh_destroy_device.argtypes = [ctypes.c_uint64]
@@ -3098,6 +3237,7 @@ class Runtime:
                 ctypes.c_int,
                 ctypes.c_int,
                 ctypes.c_int,
+                ctypes.c_int,
             ]
 
             self.core.mesh_create_device.restype = ctypes.c_uint64
@@ -3106,6 +3246,7 @@ class Runtime:
                 warp.types.array_t,
                 warp.types.array_t,
                 warp.types.array_t,
+                ctypes.c_int,
                 ctypes.c_int,
                 ctypes.c_int,
                 ctypes.c_int,
@@ -3134,26 +3275,6 @@ class Runtime:
             self.core.hash_grid_destroy_device.argtypes = [ctypes.c_uint64]
             self.core.hash_grid_update_device.argtypes = [ctypes.c_uint64, ctypes.c_float, ctypes.c_void_p]
             self.core.hash_grid_reserve_device.argtypes = [ctypes.c_uint64, ctypes.c_int]
-
-            self.core.cutlass_gemm.argtypes = [
-                ctypes.c_void_p,
-                ctypes.c_int,
-                ctypes.c_int,
-                ctypes.c_int,
-                ctypes.c_int,
-                ctypes.c_char_p,
-                ctypes.c_void_p,
-                ctypes.c_void_p,
-                ctypes.c_void_p,
-                ctypes.c_void_p,
-                ctypes.c_float,
-                ctypes.c_float,
-                ctypes.c_bool,
-                ctypes.c_bool,
-                ctypes.c_bool,
-                ctypes.c_int,
-            ]
-            self.core.cutlass_gemm.restype = ctypes.c_bool
 
             self.core.volume_create_host.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_bool, ctypes.c_bool]
             self.core.volume_create_host.restype = ctypes.c_uint64
@@ -3185,36 +3306,18 @@ class Runtime:
             ]
             self.core.volume_destroy_device.argtypes = [ctypes.c_uint64]
 
-            self.core.volume_f_from_tiles_device.argtypes = [
+            self.core.volume_from_tiles_device.argtypes = [
                 ctypes.c_void_p,
                 ctypes.c_void_p,
                 ctypes.c_int,
                 ctypes.c_float * 9,
                 ctypes.c_float * 3,
                 ctypes.c_bool,
-                ctypes.c_float,
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.c_char_p,
             ]
-            self.core.volume_f_from_tiles_device.restype = ctypes.c_uint64
-            self.core.volume_v_from_tiles_device.argtypes = [
-                ctypes.c_void_p,
-                ctypes.c_void_p,
-                ctypes.c_int,
-                ctypes.c_float * 9,
-                ctypes.c_float * 3,
-                ctypes.c_bool,
-                ctypes.c_float * 3,
-            ]
-            self.core.volume_v_from_tiles_device.restype = ctypes.c_uint64
-            self.core.volume_i_from_tiles_device.argtypes = [
-                ctypes.c_void_p,
-                ctypes.c_void_p,
-                ctypes.c_int,
-                ctypes.c_float * 9,
-                ctypes.c_float * 3,
-                ctypes.c_bool,
-                ctypes.c_int,
-            ]
-            self.core.volume_i_from_tiles_device.restype = ctypes.c_uint64
+            self.core.volume_from_tiles_device.restype = ctypes.c_uint64
             self.core.volume_index_from_tiles_device.argtypes = [
                 ctypes.c_void_p,
                 ctypes.c_void_p,
@@ -3283,6 +3386,7 @@ class Runtime:
                 ctypes.POINTER(ctypes.c_int),  # tpl_cols
                 ctypes.c_void_p,  # tpl_values
                 ctypes.c_bool,  # prune_numerical_zeros
+                ctypes.c_bool,  # masked
                 ctypes.POINTER(ctypes.c_int),  # bsr_offsets
                 ctypes.POINTER(ctypes.c_int),  # bsr_columns
                 ctypes.c_void_p,  # bsr_values
@@ -3317,8 +3421,6 @@ class Runtime:
             self.core.is_cuda_enabled.restype = ctypes.c_int
             self.core.is_cuda_compatibility_enabled.argtypes = None
             self.core.is_cuda_compatibility_enabled.restype = ctypes.c_int
-            self.core.is_cutlass_enabled.argtypes = None
-            self.core.is_cutlass_enabled.restype = ctypes.c_int
             self.core.is_mathdx_enabled.argtypes = None
             self.core.is_mathdx_enabled.restype = ctypes.c_int
 
@@ -3346,10 +3448,16 @@ class Runtime:
             self.core.cuda_device_is_uva.restype = ctypes.c_int
             self.core.cuda_device_is_mempool_supported.argtypes = [ctypes.c_int]
             self.core.cuda_device_is_mempool_supported.restype = ctypes.c_int
+            self.core.cuda_device_is_ipc_supported.argtypes = [ctypes.c_int]
+            self.core.cuda_device_is_ipc_supported.restype = ctypes.c_int
             self.core.cuda_device_set_mempool_release_threshold.argtypes = [ctypes.c_int, ctypes.c_uint64]
             self.core.cuda_device_set_mempool_release_threshold.restype = ctypes.c_int
             self.core.cuda_device_get_mempool_release_threshold.argtypes = [ctypes.c_int]
             self.core.cuda_device_get_mempool_release_threshold.restype = ctypes.c_uint64
+            self.core.cuda_device_get_mempool_used_mem_current.argtypes = [ctypes.c_int]
+            self.core.cuda_device_get_mempool_used_mem_current.restype = ctypes.c_uint64
+            self.core.cuda_device_get_mempool_used_mem_high.argtypes = [ctypes.c_int]
+            self.core.cuda_device_get_mempool_used_mem_high.restype = ctypes.c_uint64
             self.core.cuda_device_get_memory_info.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p]
             self.core.cuda_device_get_memory_info.restype = None
             self.core.cuda_device_get_uuid.argtypes = [ctypes.c_int, ctypes.c_char * 16]
@@ -3399,6 +3507,22 @@ class Runtime:
             self.core.cuda_set_mempool_access_enabled.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
             self.core.cuda_set_mempool_access_enabled.restype = ctypes.c_int
 
+            # inter-process communication
+            self.core.cuda_ipc_get_mem_handle.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_char)]
+            self.core.cuda_ipc_get_mem_handle.restype = None
+            self.core.cuda_ipc_open_mem_handle.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_char)]
+            self.core.cuda_ipc_open_mem_handle.restype = ctypes.c_void_p
+            self.core.cuda_ipc_close_mem_handle.argtypes = [ctypes.c_void_p]
+            self.core.cuda_ipc_close_mem_handle.restype = None
+            self.core.cuda_ipc_get_event_handle.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_char),
+            ]
+            self.core.cuda_ipc_get_event_handle.restype = None
+            self.core.cuda_ipc_open_event_handle.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_char)]
+            self.core.cuda_ipc_open_event_handle.restype = ctypes.c_void_p
+
             self.core.cuda_stream_create.argtypes = [ctypes.c_void_p, ctypes.c_int]
             self.core.cuda_stream_create.restype = ctypes.c_void_p
             self.core.cuda_stream_destroy.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
@@ -3446,6 +3570,7 @@ class Runtime:
 
             self.core.cuda_compile_program.argtypes = [
                 ctypes.c_char_p,  # cuda_src
+                ctypes.c_char_p,  # program name
                 ctypes.c_int,  # arch
                 ctypes.c_char_p,  # include_dir
                 ctypes.c_int,  # num_cuda_include_dirs
@@ -3454,10 +3579,13 @@ class Runtime:
                 ctypes.c_bool,  # verbose
                 ctypes.c_bool,  # verify_fp
                 ctypes.c_bool,  # fast_math
+                ctypes.c_bool,  # fuse_fp
+                ctypes.c_bool,  # lineinfo
                 ctypes.c_char_p,  # output_path
                 ctypes.c_size_t,  # num_ltoirs
                 ctypes.POINTER(ctypes.c_char_p),  # ltoirs
                 ctypes.POINTER(ctypes.c_size_t),  # ltoir_sizes
+                ctypes.POINTER(ctypes.c_int),  # ltoir_input_types, each of type nvJitLinkInputType
             ]
             self.core.cuda_compile_program.restype = ctypes.c_size_t
 
@@ -3496,6 +3624,22 @@ class Runtime:
                 ctypes.c_int,  # num threads
             ]
             self.core.cuda_compile_dot.restype = ctypes.c_bool
+
+            self.core.cuda_compile_solver.argtypes = [
+                ctypes.c_char_p,  # universal fatbin
+                ctypes.c_char_p,  # lto
+                ctypes.c_char_p,  # function name
+                ctypes.c_int,  # num include dirs
+                ctypes.POINTER(ctypes.c_char_p),  # include dirs
+                ctypes.c_char_p,  # mathdx include dir
+                ctypes.c_int,  # arch
+                ctypes.c_int,  # M
+                ctypes.c_int,  # N
+                ctypes.c_int,  # precision
+                ctypes.c_int,  # fill_mode
+                ctypes.c_int,  # num threads
+            ]
+            self.core.cuda_compile_fft.restype = ctypes.c_bool
 
             self.core.cuda_load_module.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
             self.core.cuda_load_module.restype = ctypes.c_void_p
@@ -4048,7 +4192,13 @@ def unmap_cuda_device(alias: str) -> None:
 
 
 def is_mempool_supported(device: Devicelike) -> bool:
-    """Check if CUDA memory pool allocators are available on the device."""
+    """Check if CUDA memory pool allocators are available on the device.
+
+    Parameters:
+        device: The :class:`Device <warp.context.Device>` or device identifier
+          for which the query is to be performed.
+          If ``None``, the default device will be used.
+    """
 
     init()
 
@@ -4058,7 +4208,13 @@ def is_mempool_supported(device: Devicelike) -> bool:
 
 
 def is_mempool_enabled(device: Devicelike) -> bool:
-    """Check if CUDA memory pool allocators are enabled on the device."""
+    """Check if CUDA memory pool allocators are enabled on the device.
+
+    Parameters:
+        device: The :class:`Device <warp.context.Device>` or device identifier
+          for which the query is to be performed.
+          If ``None``, the default device will be used.
+    """
 
     init()
 
@@ -4078,6 +4234,11 @@ def set_mempool_enabled(device: Devicelike, enable: bool) -> None:
     to Warp.  The preferred solution is to enable memory pool access using :func:`set_mempool_access_enabled`.
     If peer access is not supported, then the default CUDA allocators must be used to pre-allocate the memory
     prior to graph capture.
+
+    Parameters:
+        device: The :class:`Device <warp.context.Device>` or device identifier
+          for which the operation is to be performed.
+          If ``None``, the default device will be used.
     """
 
     init()
@@ -4108,6 +4269,18 @@ def set_mempool_release_threshold(device: Devicelike, threshold: Union[int, floa
     Values between 0 and 1 are interpreted as fractions of available memory.  For example, 0.5 means
     half of the device's physical memory.  Greater values are interpreted as an absolute number of bytes.
     For example, 1024**3 means one GiB of memory.
+
+    Parameters:
+        device: The :class:`Device <warp.context.Device>` or device identifier
+          for which the operation is to be performed.
+          If ``None``, the default device will be used.
+        threshold: An integer representing a number of bytes, or a ``float`` between 0 and 1,
+          specifying the desired release threshold.
+
+    Raises:
+        ValueError: If ``device`` is not a CUDA device.
+        RuntimeError: If ``device`` is a CUDA device, but does not support memory pools.
+        RuntimeError: Failed to set the memory pool release threshold.
     """
 
     init()
@@ -4129,8 +4302,21 @@ def set_mempool_release_threshold(device: Devicelike, threshold: Union[int, floa
         raise RuntimeError(f"Failed to set memory pool release threshold for device {device}")
 
 
-def get_mempool_release_threshold(device: Devicelike) -> int:
-    """Get the CUDA memory pool release threshold on the device in bytes."""
+def get_mempool_release_threshold(device: Devicelike = None) -> int:
+    """Get the CUDA memory pool release threshold on the device.
+
+    Parameters:
+        device: The :class:`Device <warp.context.Device>` or device identifier
+          for which the query is to be performed.
+          If ``None``, the default device will be used.
+
+    Returns:
+        The memory pool release threshold in bytes.
+
+    Raises:
+        ValueError: If ``device`` is not a CUDA device.
+        RuntimeError: If ``device`` is a CUDA device, but does not support memory pools.
+    """
 
     init()
 
@@ -4143,6 +4329,64 @@ def get_mempool_release_threshold(device: Devicelike) -> int:
         raise RuntimeError(f"Device {device} does not support memory pools")
 
     return runtime.core.cuda_device_get_mempool_release_threshold(device.ordinal)
+
+
+def get_mempool_used_mem_current(device: Devicelike = None) -> int:
+    """Get the amount of memory from the device's memory pool that is currently in use by the application.
+
+    Parameters:
+        device: The :class:`Device <warp.context.Device>` or device identifier
+          for which the query is to be performed.
+          If ``None``, the default device will be used.
+
+    Returns:
+        The amount of memory used in bytes.
+
+    Raises:
+        ValueError: If ``device`` is not a CUDA device.
+        RuntimeError: If ``device`` is a CUDA device, but does not support memory pools.
+    """
+
+    init()
+
+    device = runtime.get_device(device)
+
+    if not device.is_cuda:
+        raise ValueError("Memory pools are only supported on CUDA devices")
+
+    if not device.is_mempool_supported:
+        raise RuntimeError(f"Device {device} does not support memory pools")
+
+    return runtime.core.cuda_device_get_mempool_used_mem_current(device.ordinal)
+
+
+def get_mempool_used_mem_high(device: Devicelike = None) -> int:
+    """Get the application's memory usage high-water mark from the device's CUDA memory pool.
+
+    Parameters:
+        device: The :class:`Device <warp.context.Device>` or device identifier
+          for which the query is to be performed.
+          If ``None``, the default device will be used.
+
+    Returns:
+        The high-water mark of memory used from the memory pool in bytes.
+
+    Raises:
+        ValueError: If ``device`` is not a CUDA device.
+        RuntimeError: If ``device`` is a CUDA device, but does not support memory pools.
+    """
+
+    init()
+
+    device = runtime.get_device(device)
+
+    if not device.is_cuda:
+        raise ValueError("Memory pools are only supported on CUDA devices")
+
+    if not device.is_mempool_supported:
+        raise RuntimeError(f"Device {device} does not support memory pools")
+
+    return runtime.core.cuda_device_get_mempool_used_mem_high(device.ordinal)
 
 
 def is_peer_access_supported(target_device: Devicelike, peer_device: Devicelike) -> bool:
@@ -4847,6 +5091,40 @@ def from_numpy(
     )
 
 
+def event_from_ipc_handle(handle, device: "Devicelike" = None) -> Event:
+    """Create an event from an IPC handle.
+
+    Args:
+        handle: The interprocess event handle for an existing CUDA event.
+        device (Devicelike): Device to associate with the array.
+
+    Returns:
+        An event created from the interprocess event handle ``handle``.
+
+    Raises:
+        RuntimeError: IPC is not supported on ``device``.
+    """
+
+    try:
+        # Performance note: try first, ask questions later
+        device = warp.context.runtime.get_device(device)
+    except Exception:
+        # Fallback to using the public API for retrieving the device,
+        # which takes take of initializing Warp if needed.
+        device = warp.context.get_device(device)
+
+    if device.is_ipc_supported is False:
+        raise RuntimeError(f"IPC is not supported on device {device}.")
+
+    event = Event(
+        device=device, cuda_event=warp.context.runtime.core.cuda_ipc_open_event_handle(device.context, handle)
+    )
+    # Events created from IPC handles must be freed with cuEventDestroy
+    event.owner = True
+
+    return event
+
+
 # given a kernel destination argument type and a value convert
 #  to a c-type that can be passed to a kernel
 def pack_arg(kernel, arg_type, arg_name, value, device, adjoint=False):
@@ -4928,6 +5206,9 @@ def pack_arg(kernel, arg_type, arg_name, value, device, adjoint=False):
 
     # try to convert to a value type (vec3, mat33, etc)
     elif issubclass(arg_type, ctypes.Array):
+        # simple value types don't have gradient arrays, but native built-in signatures still expect a non-null adjoint value of the correct type
+        if value is None and adjoint:
+            return arg_type(0)
         if warp.types.types_equal(type(value), arg_type):
             return value
         else:
@@ -4936,9 +5217,6 @@ def pack_arg(kernel, arg_type, arg_name, value, device, adjoint=False):
                 return arg_type(value)
             except Exception as e:
                 raise ValueError(f"Failed to convert argument for param {arg_name} to {type_str(arg_type)}") from e
-
-    elif isinstance(value, bool):
-        return ctypes.c_bool(value)
 
     elif isinstance(value, arg_type):
         try:
@@ -4954,6 +5232,9 @@ def pack_arg(kernel, arg_type, arg_name, value, device, adjoint=False):
             ) from e
 
     else:
+        # scalar args don't have gradient arrays, but native built-in signatures still expect a non-null scalar adjoint
+        if value is None and adjoint:
+            return arg_type._type_(0)
         try:
             # try to pack as a scalar type
             if arg_type is warp.types.float16:
@@ -6013,14 +6294,19 @@ def export_functions_rst(file):  # pragma: no cover
     # build dictionary of all functions by group
     groups = {}
 
-    for _k, f in builtin_functions.items():
+    functions = list(builtin_functions.values())
+
+    for f in functions:
         # build dict of groups
         if f.group not in groups:
             groups[f.group] = []
 
-        # append all overloads to the group
-        for o in f.overloads:
-            groups[f.group].append(o)
+        if hasattr(f, "overloads"):
+            # append all overloads to the group
+            for o in f.overloads:
+                groups[f.group].append(o)
+        else:
+            groups[f.group].append(f)
 
     # Keep track of what function and query types have been written
     written_functions = set()
@@ -6040,6 +6326,10 @@ def export_functions_rst(file):  # pragma: no cover
         print("---------------", file=file)
 
         for f in g:
+            if f.func:
+                # f is a Warp function written in Python, we can use autofunction
+                print(f".. autofunction:: {f.func.__module__}.{f.key}", file=file)
+                continue
             for f_prefix, query_type in query_types:
                 if f.key.startswith(f_prefix) and query_type not in written_query_types:
                     print(f".. autoclass:: {query_type}", file=file)
@@ -6097,24 +6387,32 @@ def export_stubs(file):  # pragma: no cover
     print(header, file=file)
     print(file=file)
 
-    for k, g in builtin_functions.items():
-        for f in g.overloads:
-            args = ", ".join(f"{k}: {type_str(v)}" for k, v in f.input_types.items())
+    def add_stub(f):
+        args = ", ".join(f"{k}: {type_str(v)}" for k, v in f.input_types.items())
 
-            return_str = ""
+        return_str = ""
 
-            if f.hidden:  # or f.generic:
-                continue
+        if f.hidden:  # or f.generic:
+            return
 
+        return_type = f.value_type
+        if f.value_func:
             return_type = f.value_func(None, None)
-            if return_type:
-                return_str = " -> " + type_str(return_type)
+        if return_type:
+            return_str = " -> " + type_str(return_type)
 
-            print("@over", file=file)
-            print(f"def {f.key}({args}){return_str}:", file=file)
-            print(f'    """{f.doc}', file=file)
-            print('    """', file=file)
-            print("    ...\n\n", file=file)
+        print("@over", file=file)
+        print(f"def {f.key}({args}){return_str}:", file=file)
+        print(f'    """{f.doc}', file=file)
+        print('    """', file=file)
+        print("    ...\n\n", file=file)
+
+    for g in builtin_functions.values():
+        if hasattr(g, "overloads"):
+            for f in g.overloads:
+                add_stub(f)
+        else:
+            add_stub(g)
 
 
 def export_builtins(file: io.TextIOBase):  # pragma: no cover
@@ -6140,6 +6438,8 @@ def export_builtins(file: io.TextIOBase):  # pragma: no cover
     file.write('extern "C" {\n\n')
 
     for k, g in builtin_functions.items():
+        if not hasattr(g, "overloads"):
+            continue
         for f in g.overloads:
             if not f.export or f.generic:
                 continue

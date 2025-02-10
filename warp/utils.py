@@ -782,9 +782,9 @@ class ScopedTimer:
                     print()
 
                 if self.extra_msg:
-                    print(f"{indent}{self.name} took {self.elapsed :.2f} ms {self.extra_msg}")
+                    print(f"{indent}{self.name} took {self.elapsed:.2f} ms {self.extra_msg}")
                 else:
-                    print(f"{indent}{self.name} took {self.elapsed :.2f} ms")
+                    print(f"{indent}{self.name} took {self.elapsed:.2f} ms")
 
                 ScopedTimer.indent -= 1
 
@@ -858,27 +858,6 @@ class ScopedCapture:
                 self.graph = wp.capture_end(device=self.device, stream=self.stream)
             finally:
                 self.active = False
-
-
-# helper kernels for adj_matmul
-@wp.kernel
-def add_kernel_2d(x: wp.array2d(dtype=Any), acc: wp.array2d(dtype=Any), beta: Any):
-    i, j = wp.tid()
-
-    x[i, j] = x[i, j] + beta * acc[i, j]
-
-
-@wp.kernel
-def add_kernel_3d(x: wp.array3d(dtype=Any), acc: wp.array3d(dtype=Any), beta: Any):
-    i, j, k = wp.tid()
-
-    x[i, j, k] = x[i, j, k] + beta * acc[i, j, k]
-
-
-# explicit instantiations of generic kernels for adj_matmul
-for T in [wp.float16, wp.float32, wp.float64]:
-    wp.overload(add_kernel_2d, [wp.array2d(dtype=T), wp.array2d(dtype=T), T])
-    wp.overload(add_kernel_3d, [wp.array3d(dtype=T), wp.array3d(dtype=T), T])
 
 
 def check_p2p():
@@ -1045,7 +1024,7 @@ def timing_print(results, indent=""):
             activity_agg.count += 1
             activity_agg.elapsed += r.elapsed
 
-        print(f"{indent}{r.elapsed :12.6f} ms | {r.device.alias :7s} | {r.name}")
+        print(f"{indent}{r.elapsed:12.6f} ms | {r.device.alias:7s} | {r.name}")
 
     print()
     print(f"{indent}CUDA activity summary:")
@@ -1053,7 +1032,7 @@ def timing_print(results, indent=""):
     print(f"{indent}Total time      | Count   | Activity")
     print(f"{indent}----------------+---------+{activity_dashes}")
     for name, agg in activity_totals.items():
-        print(f"{indent}{agg.elapsed :12.6f} ms | {agg.count :7d} | {name}")
+        print(f"{indent}{agg.elapsed:12.6f} ms | {agg.count:7d} | {name}")
 
     print()
     print(f"{indent}CUDA device summary:")
@@ -1061,4 +1040,4 @@ def timing_print(results, indent=""):
     print(f"{indent}Total time      | Count   | Device")
     print(f"{indent}----------------+---------+{activity_dashes}")
     for device, agg in device_totals.items():
-        print(f"{indent}{agg.elapsed :12.6f} ms | {agg.count :7d} | {device}")
+        print(f"{indent}{agg.elapsed:12.6f} ms | {agg.count:7d} | {device}")
